@@ -1,0 +1,41 @@
+name: anhui-2026-vocational-rank
+description: 安徽省 2026 年普通高职（专科）提前批院校投档最低分及名次表。
+priority: 110
+match:
+  path_contains:
+    - anhui/2026
+    - 普通高职（专科）提前批院校投档最低分及名次
+parser: spatial_rows
+columns:
+  - name: 院校代码
+    x_min: 0.03
+    x_max: 0.11
+    type: code
+  - name: 院校名称
+    x_min: 0.11
+    x_max: 0.34
+    type: text
+  - name: 科类
+    x_min: 0.34
+    x_max: 0.46
+    type: text
+  - name: 院校专业组
+    x_min: 0.46
+    x_max: 0.79
+    type: text
+  - name: 投档最低分
+    x_min: 0.79
+    x_max: 0.88
+    type: integer
+  - name: 投档最低分名次
+    x_min: 0.88
+    x_max: 0.98
+    type: integer
+required: [院校代码, 院校名称, 科类, 院校专业组, 投档最低分]
+code_fields: [院校代码]
+fill_down: []
+skip_if_contains:
+  - 院校代码
+  - 院校代号
+minimum_populated_fields: 4
+review_all: false

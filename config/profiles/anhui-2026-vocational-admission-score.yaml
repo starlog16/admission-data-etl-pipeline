@@ -1,0 +1,37 @@
+name: anhui-2026-vocational-admission-score
+description: 安徽省 2026 年普通高职（专科）提前批院校录取最低分表。
+priority: 110
+match:
+  path_contains:
+    - anhui/2026
+    - 普通高职（专科）提前批院校录取最低分
+parser: spatial_rows
+columns:
+  - name: 科类
+    x_min: 0.07
+    x_max: 0.19
+    type: text
+  - name: 院校代码
+    x_min: 0.19
+    x_max: 0.28
+    type: code
+  - name: 院校名称
+    x_min: 0.28
+    x_max: 0.59
+    type: text
+  - name: 院校专业组
+    x_min: 0.59
+    x_max: 0.79
+    type: text
+  - name: 录取最低分
+    x_min: 0.79
+    x_max: 0.91
+    type: integer
+required: [科类, 院校代码, 院校名称, 院校专业组, 录取最低分]
+code_fields: [院校代码]
+fill_down: []
+skip_if_contains:
+  - 院校代码
+  - 院校代号
+minimum_populated_fields: 4
+review_all: false

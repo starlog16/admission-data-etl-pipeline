@@ -1,0 +1,28 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.test-temp-*/
+.env
+.env.*
+
+# Claude Code 本机权限设置不共享
+.claude/settings.local.json
+
+# 早期实验脚本不进入稳定版本
+scripts/experimental/
+
+# 原始材料、OCR 缓存、日志与结果不进入 Git
+input/raw/
+temp/
+logs/
+output/
+*.xlsx
+*.xls
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.tif
+*.tiff

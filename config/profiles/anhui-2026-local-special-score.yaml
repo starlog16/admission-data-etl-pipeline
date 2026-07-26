@@ -1,0 +1,43 @@
+name: anhui-2026-local-special-score
+description: 安徽省 2026 年地方专项首轮投档最低分及名次表（较窄表格，历史/物理）。
+priority: 120
+match:
+  path_contains:
+    - anhui/2026
+    - 地方专项计划首轮
+    - 最低分
+    - 名次
+parser: spatial_rows
+columns:
+  - name: 院校代码
+    x_min: 0.04
+    x_max: 0.18
+    type: code
+  - name: 院校名称
+    x_min: 0.18
+    x_max: 0.33
+    type: text
+  - name: 专业组
+    x_min: 0.33
+    x_max: 0.55
+    type: text
+  - name: 投档人数
+    x_min: 0.55
+    x_max: 0.64
+    type: integer
+  - name: 最低分
+    x_min: 0.64
+    x_max: 0.74
+    type: integer
+  - name: 最低分名次
+    x_min: 0.74
+    x_max: 0.99
+    type: integer
+required: [院校代码, 院校名称, 专业组, 最低分, 最低分名次]
+code_fields: [院校代码]
+fill_down: []
+skip_if_contains:
+  - 院校代码
+  - 院校代号
+minimum_populated_fields: 4
+review_all: false

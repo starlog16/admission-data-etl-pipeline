@@ -1,0 +1,53 @@
+name: institution-score-components
+description: 分段的一行一院校投档表，含计划数、投档人数、最高分和最低排序分分项。
+priority: 103
+match:
+  text_contains:
+    - 最低投档排序分
+    - 排序成绩
+parser: structured_table
+fallback_parser: spatial_rows
+constants:
+  数据类型: 投档数据
+context_patterns:
+  科类: '（(?P<value>文史|理工)）'
+  批次: '(?P<value>本科一批次平行志愿)'
+columns:
+  - {name: 院校代码, x_min: 0.070, x_max: 0.180, type: code}
+  - {name: 院校名称, x_min: 0.180, x_max: 0.380, type: text}
+  - {name: 计划数, x_min: 0.380, x_max: 0.465, type: integer}
+  - {name: 投档人数, x_min: 0.465, x_max: 0.540, type: integer}
+  - {name: 最高分, x_min: 0.540, x_max: 0.620, type: integer}
+  - {name: 最低分, x_min: 0.620, x_max: 0.700, type: integer}
+  - {name: 最低分排序一, x_min: 0.700, x_max: 0.785, type: integer}
+  - {name: 最低分排序二, x_min: 0.785, x_max: 0.865, type: integer}
+  - {name: 最低分排序三, x_min: 0.865, x_max: 0.940, type: integer}
+column_map:
+  院校代码: 0
+  院校名称: 1
+  计划数: 2
+  投档人数: 3
+  最高分: 4
+  最低分: 5
+  最低分排序一: 6
+  最低分排序二: 7
+  最低分排序三: 8
+dynamic_fields:
+  科类:
+    文史:
+      最低分排序一: 语文
+      最低分排序二: 综合
+      最低分排序三: 数学
+    理工:
+      最低分排序一: 数学
+      最低分排序二: 综合
+      最低分排序三: 语文
+integer_fields: [计划数, 投档人数, 最高分, 最低分, 语文, 数学, 综合]
+section_pattern: '^(国家及地方专项|南疆单列|对口援疆计划.*|对口援疆.*)$'
+section_field: 计划类别
+required: [院校代码, 院校名称, 计划数, 投档人数, 最高分, 最低分]
+row_key: {field: 院校代码, pattern: '\d{4}'}
+minimum_populated_fields: 8
+code_fields: [院校代码]
+skip_if_contains: [院校代号, 最低投档排序分, 排序成绩]
+review_all: false

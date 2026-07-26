@@ -1,0 +1,29 @@
+version: 1
+
+paths:
+  input_root: input/raw
+  excel_root: output/excel
+  archive_root: output/archive
+  review_root: output/review
+  temp_root: temp
+  logs_root: logs
+  profiles_root: config/profiles
+
+extraction:
+  image_extensions: [.png, .jpg, .jpeg, .webp, .tif, .tiff, .bmp]
+  pdf_extensions: [.pdf]
+  spreadsheet_extensions: [.xlsx, .xlsm]
+  pdf_text_min_chars_per_page: 80
+  pdf_render_dpi: 220
+  ocr_min_score: 0.45
+  ocr_global_max_side_len: 10000
+  cache_version: 2
+
+parsing:
+  default_profile: generic-review
+  row_y_tolerance_ratio: 0.65
+
+export:
+  freeze_header: true
+  enable_filter: true
+  include_trace_columns: true

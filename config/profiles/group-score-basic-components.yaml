@@ -1,0 +1,40 @@
+name: group-score-basic-components
+description: 一行一个院校专业组，含最低总分及语文、数学、外语分项的投档表。
+priority: 103
+match:
+  text_contains:
+    - 普通高校在津招生录取最低分统计表
+    - 普通类本科批A阶段
+parser: structured_table
+fallback_parser: spatial_rows
+constants:
+  数据类型: 投档数据
+context_patterns:
+  批次: '(?P<value>普通类本科批[AB]阶段[^最低分]*)'
+columns:
+  - {name: 序号, x_min: 0.035, x_max: 0.105, type: integer}
+  - {name: 院校专业组代码, x_min: 0.105, x_max: 0.280, type: code}
+  - {name: 院校名称, x_min: 0.280, x_max: 0.650, type: text}
+  - {name: 最低分, x_min: 0.650, x_max: 0.740, type: integer}
+  - {name: 语文, x_min: 0.740, x_max: 0.810, type: integer}
+  - {name: 数学, x_min: 0.810, x_max: 0.880, type: integer}
+  - {name: 外语, x_min: 0.880, x_max: 0.970, type: integer}
+derive_fields:
+  - source: 院校专业组代码
+    pattern: '^(\d{4})(\d{2})$'
+    fields: [院校代码, 专业组代码]
+column_map:
+  序号: 0
+  院校专业组代码: 1
+  院校名称: 2
+  最低分: 3
+  语文: 4
+  数学: 5
+  外语: 6
+integer_fields: [序号, 最低分, 语文, 数学, 外语]
+required: [院校专业组代码, 院校名称, 最低分]
+row_key: {field: 序号, pattern: '\d+'}
+minimum_populated_fields: 6
+code_fields: [院校专业组代码, 院校代码, 专业组代码]
+skip_if_contains: [院校专业组代码, 最低分总分]
+review_all: false

@@ -1,0 +1,38 @@
+name: spreadsheet-group-plan
+description: 原始 Excel 中一行一个院校专业组的征集计划。
+priority: 104
+match:
+  text_contains:
+    - 计划类别
+    - 院校代号
+    - 专业组编号
+    - 专业组名称
+    - 计划数
+parser: structured_table
+constants:
+  数据类型: 征集计划
+columns:
+  - {name: 计划类别, x_min: 0.000, x_max: 0.125, type: text}
+  - {name: 科类, x_min: 0.125, x_max: 0.250, type: text}
+  - {name: 院校代码, x_min: 0.250, x_max: 0.375, type: code}
+  - {name: 院校名称, x_min: 0.375, x_max: 0.500, type: text}
+  - {name: 专业组代码, x_min: 0.500, x_max: 0.625, type: code}
+  - {name: 专业组名称, x_min: 0.625, x_max: 0.750, type: text}
+  - {name: 计划数, x_min: 0.750, x_max: 0.875, type: integer}
+  - {name: 备注, x_min: 0.875, x_max: 1.000, type: text}
+column_map:
+  计划类别: 0
+  科类: 1
+  院校代码: 2
+  院校名称: 3
+  专业组代码: 4
+  专业组名称: 5
+  计划数: 6
+  备注: 7
+integer_fields: [计划数]
+required: [计划类别, 科类, 院校代码, 院校名称, 专业组代码, 专业组名称, 计划数]
+row_key: {field: 院校代码, pattern: '[0-9A-Za-z]{4,6}'}
+minimum_populated_fields: 6
+code_fields: [院校代码, 专业组代码]
+skip_if_contains: [计划类别, 说明：]
+review_all: false

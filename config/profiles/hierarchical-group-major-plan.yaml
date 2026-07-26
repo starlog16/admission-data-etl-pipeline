@@ -1,0 +1,38 @@
+name: hierarchical-group-major-plan
+description: 单栏“院校→专业组→专业”征集余缺计划，含学制、计划数、学费、语种和备注。
+priority: 105
+match:
+  text_contains:
+    - 院校专业组
+    - 专业名称及招考方向
+    - 普通类本科批
+parser: hierarchical_group_major_plan
+constants:
+  数据类型: 征集计划
+context_patterns:
+  批次: '(?P<value>普通类本科批[AB]阶段)'
+bands:
+  pre_description: [0.015, 0.400]
+  identity: [0.015, 0.095]
+  subject: [0.095, 0.175]
+  description: [0.175, 0.400]
+  duration: [0.400, 0.449]
+  plan: [0.449, 0.490]
+  tuition: [0.490, 0.555]
+  language: [0.560, 0.615]
+  oral: [0.615, 0.663]
+  remark: [0.663, 1.000]
+group_pattern: '\d{6}'
+major_pattern: '[0-9A-Za-z]{2}'
+institution_code_length: 4
+subject_keywords: [物加化加生, 物加化, 物加生, 物加政, 物加地, 史加政, 史加地, 不限]
+required: [院校代码, 院校名称, 院校专业组代码, 专业代码, 专业名称及专业方向, 计划数]
+integer_fields: [院校计划总数, 专业组计划数, 计划数, 学制, 收费标准]
+code_fields: [院校代码, 专业组代码, 专业代码, 院校专业组代码]
+skip_if_contains:
+  - 院校专业组及专业代码
+  - 院校专业组科目要求
+  - 专业名称及招考方向
+  - 普通类本科批
+  - 说明：
+review_all: false

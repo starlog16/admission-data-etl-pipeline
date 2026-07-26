@@ -1,0 +1,49 @@
+name: flat-major-plan
+description: 一行一个专业，含院校、专业、分数线、选科、计划、学制、学费和说明的计划表。
+priority: 103
+match:
+  text_contains:
+    - 本科提前批B段征集志愿计划统计表
+    - 专业说明
+parser: structured_table
+fallback_parser: flat_major_plan
+constants:
+  数据类型: 征集计划
+context_patterns:
+  批次: '(?P<value>本科提前批B段征集志愿)'
+bands:
+  sequence: [0.020, 0.055]
+  subject_code: [0.055, 0.145]
+  institution_name: [0.145, 0.295]
+  category: [0.295, 0.370]
+  major_code: [0.370, 0.445]
+  major_name: [0.445, 0.575]
+  score_line: [0.575, 0.620]
+  subject_requirement: [0.620, 0.665]
+  plan: [0.665, 0.695]
+  language: [0.695, 0.730]
+  duration: [0.730, 0.760]
+  tuition: [0.760, 0.805]
+  remark: [0.805, 1.000]
+subject_code_pattern: '^(历史类|物理类|文史|理工)([0-9A-Za-z]+)$'
+column_map:
+  序号: 0
+  科类: 1
+  院校代码: 2
+  院校名称: 3
+  计划类别: 4
+  专业代码: 5
+  专业名称及专业方向: 6
+  分数线: 7
+  再选科目: 8
+  计划数: 9
+  外语语种: 10
+  学制: 11
+  学费: 12
+  备注: 13
+row_key: {field: 序号, pattern: '\d+'}
+required: [科类, 院校代码, 院校名称, 专业代码, 专业名称及专业方向, 计划数]
+integer_fields: [序号, 分数线, 计划数, 学制, 学费]
+code_fields: [院校代码, 专业代码]
+skip_if_contains: [贵州省2026年, 院校代码, 专业代码, 历史类合计, 物理类合计]
+review_all: false

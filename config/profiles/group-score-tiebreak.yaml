@@ -1,0 +1,45 @@
+name: group-score-tiebreak
+description: 一行一个院校专业组，含投档最低分和同分排序项的投档表。
+priority: 103
+match:
+  text_contains:
+    - 征求志愿投档线
+    - 院校、专业组
+parser: structured_table
+fallback_parser: spatial_rows
+constants:
+  数据类型: 投档数据
+context_patterns:
+  科类: '（(?P<value>物理等科目类|历史等科目类)）'
+  批次: '(?P<value>普通类本科批次征求志愿)'
+columns:
+  - {name: 院校代码, x_min: 0.035, x_max: 0.095, type: code}
+  - {name: 专业组名称, x_min: 0.095, x_max: 0.590, type: text}
+  - {name: 最低分, x_min: 0.590, x_max: 0.640, type: integer}
+  - {name: 语数成绩, x_min: 0.640, x_max: 0.695, type: integer}
+  - {name: 语数最高成绩, x_min: 0.695, x_max: 0.748, type: integer}
+  - {name: 外语, x_min: 0.748, x_max: 0.802, type: integer}
+  - {name: 首选科目, x_min: 0.802, x_max: 0.855, type: integer}
+  - {name: 再选科目最高成绩, x_min: 0.855, x_max: 0.915, type: integer}
+  - {name: 志愿号, x_min: 0.915, x_max: 0.970, type: integer}
+derive_fields:
+  - source: 专业组名称
+    pattern: '(\d{2,3})专业组'
+    fields: [专业组代码]
+column_map:
+  院校代码: 0
+  专业组名称: 1
+  最低分: 2
+  语数成绩: 3
+  语数最高成绩: 4
+  外语: 5
+  首选科目: 6
+  再选科目最高成绩: 7
+  志愿号: 8
+integer_fields: [最低分, 语数成绩, 语数最高成绩, 外语, 首选科目, 再选科目最高成绩, 志愿号]
+required: [院校代码, 专业组名称, 最低分]
+row_key: {field: 院校代码, pattern: '\d{4}'}
+minimum_populated_fields: 8
+code_fields: [院校代码, 专业组代码]
+skip_if_contains: [院校代号, 投档最低分同分考生排序项]
+review_all: false
