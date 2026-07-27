@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -41,7 +42,11 @@ def _write_sheet(
     for cell in sheet[1]:
         cell.font = Font(bold=True)
     for record in records:
-        values = [record.values.get(header, "") for header in headers if header != "待复核原因"]
+        values = [
+            _excel_scalar(record.values.get(header, ""))
+            for header in headers
+            if header != "待复核原因"
+        ]
         if include_issues:
             values.append("；".join(record.issues))
         sheet.append(values)
@@ -78,18 +83,22 @@ def _add_hierarchy_summaries(workbook: Workbook, records: list[ParsedRecord]) ->
     if not hierarchy:
         return
 
-    groups: dict[tuple[str, str, str], list[ParsedRecord]] = {}
+    groups: dict[tuple[str, str, str, str], list[ParsedRecord]] = {}
     institutions: dict[tuple[str, str], list[ParsedRecord]] = {}
     for record in hierarchy:
         source = str(record.values.get("来源文件", ""))
         full_name = str(record.values.get("院校全称", "") or record.values.get("院校名称", ""))
+        institution_code = str(record.values.get("院校代码", "")).strip()
         group_code = str(record.values.get("院校专业组代码", ""))
-        groups.setdefault((source, full_name, group_code), []).append(record)
-        institutions.setdefault((source, full_name), []).append(record)
+        course = str(record.values.get("科类", ""))
+        subject = str(record.values.get("再选科目", "") or record.values.get("科目要求", ""))
+        groups.setdefault((source, course, subject, group_code), []).append(record)
+        institutions.setdefault((source, institution_code or full_name), []).append(record)
 
     group_rows: list[list[object]] = []
-    for (source, full_name, group_code), items in groups.items():
+    for (source, course, subject, group_code), items in groups.items():
         first = items[0].values
+        full_name = str(first.get("院校全称", "") or first.get("院校名称", ""))
         expected = str(first.get("专业组计划数", "")).strip()
         plans = [str(item.values.get("计划数", "")).strip() for item in items]
         actual: object = sum(int(value) for value in plans) if plans and all(value.isdigit() for value in plans) else ""
@@ -97,15 +106,21 @@ def _add_hierarchy_summaries(workbook: Workbook, records: list[ParsedRecord]) ->
         if expected.isdigit() and isinstance(actual, int) and actual != int(expected):
             result = "不一致"
         group_rows.append([
-            full_name, group_code, first.get("科目要求", ""),
+            full_name, group_code, course, subject,
             first.get("院校专业组名称", ""), expected, actual,
             len(items), min(int(item.values.get("来源页", 1)) for item in items),
             result, source,
         ])
 
     institution_rows: list[list[object]] = []
-    for (source, full_name), items in institutions.items():
+    for (source, _institution_key), items in institutions.items():
         first = items[0].values
+        institution_code = str(first.get("院校代码", "")).strip()
+        names = [
+            str(item.values.get("院校全称", "") or item.values.get("院校名称", "")).strip()
+            for item in items
+        ]
+        full_name = Counter(name for name in names if name).most_common(1)[0][0]
         expected = str(first.get("院校计划总数", "")).strip()
         plans = [str(item.values.get("计划数", "")).strip() for item in items]
         actual: object = sum(int(value) for value in plans) if plans and all(value.isdigit() for value in plans) else ""
@@ -113,7 +128,7 @@ def _add_hierarchy_summaries(workbook: Workbook, records: list[ParsedRecord]) ->
         if expected.isdigit() and isinstance(actual, int) and actual != int(expected):
             result = "不一致"
         institution_rows.append([
-            full_name, expected, actual,
+            institution_code, full_name, expected, actual,
             len({str(item.values.get("院校专业组代码", "")) for item in items}),
             len(items), min(int(item.values.get("来源页", 1)) for item in items),
             result, source,
@@ -121,12 +136,12 @@ def _add_hierarchy_summaries(workbook: Workbook, records: list[ParsedRecord]) ->
 
     _write_rows(
         workbook.create_sheet("专业组汇总"),
-        ["院校全称", "院校专业组代码", "科目要求", "院校专业组名称", "专业组计划数", "专业计划数合计", "专业数量", "来源页码", "校验结果", "来源文件"],
+        ["院校全称", "院校专业组代码", "科类", "再选科目", "院校专业组名称", "专业组计划数", "专业计划数合计", "专业数量", "来源页码", "校验结果", "来源文件"],
         group_rows,
     )
     _write_rows(
         workbook.create_sheet("院校汇总"),
-        ["院校全称", "院校计划总数", "专业计划数合计", "专业组数量", "专业数量", "起始页码", "校验结果", "来源文件"],
+        ["院校代码", "院校全称", "院校计划总数", "专业计划数合计", "专业组数量", "专业数量", "起始页码", "校验结果", "来源文件"],
         institution_rows,
     )
 

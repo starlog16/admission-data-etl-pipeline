@@ -62,7 +62,14 @@ def refine_missing_numeric_cells(
 
         for record in records:
             for field_name, field_config in fields.items():
-                if str(record.values.get(field_name, "")).strip():
+                current_value = str(record.values.get(field_name, "")).strip()
+                pattern = re.compile(str(field_config["pattern"]))
+                accept_if_source_invalid = bool(
+                    field_config.get("accept_if_source_invalid", False)
+                )
+                if current_value and (
+                    not accept_if_source_invalid or pattern.fullmatch(current_value)
+                ):
                     continue
                 row_kind = str(field_config["row"])
                 side = str(record.values.get(f"_{row_kind}_side", ""))
@@ -95,10 +102,30 @@ def refine_missing_numeric_cells(
                     changed_cache = True
                 candidate = str(cache[key].get("text", "")).strip().replace(" ", "")
                 score = float(cache[key].get("score", 0.0))
-                pattern = re.compile(str(field_config["pattern"]))
                 if score >= minimum_score and pattern.fullmatch(candidate):
-                    candidates = record.values.setdefault("_ocr_candidates", {})
-                    candidates[field_name] = candidate
+                    if accept_if_source_invalid:
+                        record.values[field_name] = candidate
+                        record.issues = [
+                            issue
+                            for issue in record.issues
+                            if issue != f"缺少必填字段：{field_name}"
+                            and not issue.startswith(f"{field_name}：")
+                            and not (
+                                field_name == "分数线"
+                                and str(record.values.get("计划数", "")).strip()
+                                and issue == "计划数或分数线 OCR 置信度较低"
+                            )
+                        ]
+                        old_fields = str(record.values.get("OCR补识别字段", "")).strip()
+                        record.values["OCR补识别字段"] = "、".join(
+                            dict.fromkeys(filter(None, [old_fields, field_name]))
+                        )
+                        record.values["OCR一致性校验"] = (
+                            "原值缺失或超范围，已用局部高置信度 OCR 复核"
+                        )
+                    else:
+                        candidates = record.values.setdefault("_ocr_candidates", {})
+                        candidates[field_name] = candidate
         _approve_consistent_plan_refinements(records)
         for record in records:
             candidates = dict(record.values.get("_ocr_candidates", {}))
@@ -125,17 +152,22 @@ def refine_missing_numeric_cells(
 def _approve_consistent_plan_refinements(records: list[ParsedRecord]) -> None:
     grouped: dict[tuple[str, str], list[ParsedRecord]] = {}
     for record in records:
+        group_code = str(record.values.get("院校专业组代码", "")).strip()
         key = (
             str(record.values.get("来源文件", "")),
-            str(record.values.get("院校代码", "")),
+            group_code or str(record.values.get("院校代码", "")),
         )
         grouped.setdefault(key, []).append(record)
 
     for school_records in grouped.values():
+        uses_group_total = bool(
+            str(school_records[0].values.get("院校专业组代码", "")).strip()
+        )
+        total_field = "专业组计划数" if uses_group_total else "院校计划总数"
         first_candidates = dict(school_records[0].values.get("_ocr_candidates", {}))
         expected = str(
-            school_records[0].values.get("院校计划总数", "")
-            or first_candidates.get("院校计划总数", "")
+            school_records[0].values.get(total_field, "")
+            or first_candidates.get(total_field, "")
         ).strip()
         plans = []
         for record in school_records:
@@ -148,7 +180,7 @@ def _approve_consistent_plan_refinements(records: list[ParsedRecord]) -> None:
         if sum(int(plan) for plan in plans) != int(expected):
             continue
         refined_sets = [set(dict(record.values.get("_ocr_candidates", {}))) for record in school_records]
-        total_refined = any("院校计划总数" in fields for fields in refined_sets)
+        total_refined = any(total_field in fields for fields in refined_sets)
         plan_refined = any("计划数" in fields for fields in refined_sets)
         if plan_refined and not total_refined:
             for record, fields in zip(school_records, refined_sets, strict=True):
@@ -164,18 +196,20 @@ def _approve_consistent_plan_refinements(records: list[ParsedRecord]) -> None:
                     record.values["OCR一致性校验"] = "专业计划合计与原始院校总数一致"
         elif total_refined and not plan_refined:
             for record, fields in zip(school_records, refined_sets, strict=True):
-                if "院校计划总数" in fields:
-                    candidate = dict(record.values.get("_ocr_candidates", {}))[
-                        "院校计划总数"
-                    ]
-                    record.values["院校计划总数"] = candidate
+                if total_field in fields:
+                    candidate = dict(record.values.get("_ocr_candidates", {}))[total_field]
+                    record.values[total_field] = candidate
                     record.issues = [
                         issue
                         for issue in record.issues
-                        if issue != "缺少必填字段：院校计划总数"
+                        if issue != f"缺少必填字段：{total_field}"
                     ]
-                    record.values["OCR补识别字段"] = "院校计划总数"
-                    record.values["OCR一致性校验"] = "原始专业计划合计与院校总数一致"
+                    record.values["OCR补识别字段"] = total_field
+                    record.values["OCR一致性校验"] = (
+                        "原始专业计划合计与专业组总数一致"
+                        if uses_group_total
+                        else "原始专业计划合计与院校总数一致"
+                    )
 
 
 def _recognize_cell(

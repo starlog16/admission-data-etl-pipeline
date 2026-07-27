@@ -111,7 +111,31 @@ def test_hierarchical_output_adds_group_and_institution_summaries(tmp_path: Path
     try:
         assert "专业组汇总" in workbook.sheetnames
         assert "院校汇总" in workbook.sheetnames
-        assert workbook["专业组汇总"]["I2"].value == "一致"
-        assert workbook["院校汇总"]["G2"].value == "一致"
+        group_headers = {
+            cell.value: cell.column for cell in workbook["专业组汇总"][1]
+        }
+        institution_headers = {
+            cell.value: cell.column for cell in workbook["院校汇总"][1]
+        }
+        assert workbook["专业组汇总"].cell(
+            row=2, column=group_headers["校验结果"]
+        ).value == "一致"
+        assert workbook["院校汇总"].cell(
+            row=2, column=institution_headers["校验结果"]
+        ).value == "一致"
+    finally:
+        workbook.close()
+
+
+def test_export_serializes_visible_container_values(tmp_path: Path) -> None:
+    output = tmp_path / "container.xlsx"
+    record = ParsedRecord(
+        values={"院校代码": "0001", "辅助信息": []},
+        issues=[],
+    )
+    export_workbook(output, [record], {"record_count": 1}, ["院校代码"])
+    workbook = load_workbook(output, read_only=True)
+    try:
+        assert workbook["data"].cell(row=2, column=2).value == "[]"
     finally:
         workbook.close()

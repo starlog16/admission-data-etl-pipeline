@@ -475,6 +475,353 @@ def parse_two_column_hierarchical_plan(
     return records
 
 
+def parse_two_column_plan_balance_score(
+    pages: list[ExtractedPage],
+    profile: dict[str, Any],
+    *,
+    y_tolerance_ratio: float,
+) -> list[ParsedRecord]:
+    """Parse two-up school/group -> major plans with plan balance and score line."""
+    records: list[ParsedRecord] = []
+    context = _extract_document_context(pages, profile)
+    regions = profile["page_regions"]
+    skip_markers = [str(value) for value in profile.get("skip_if_contains", [])]
+    required = [str(value) for value in profile.get("required", [])]
+    integer_fields = [str(value) for value in profile.get("integer_fields", [])]
+    school_pattern = re.compile(str(profile["school_pattern"]))
+    school_recovery_pattern = re.compile(
+        r"^(?P<institution_code>\d{4})\s*(?P<institution_name>.+?)\s*"
+        r"\u7b2c(?P<group_code>[0-9A-Za-z]{3})"
+        r"(?:\s+(?P<embedded_plan>\d{1,3}))?\u7ec4[\uff08(]"
+        r"(?P<group_name>.+?)(?:[\uff09)]|$)"
+    )
+    school_fallback_pattern = re.compile(r"^(?P<institution_code>\d{4})\s*(?P<institution_name>.+)$")
+    major_pattern = re.compile(str(profile.get("major_pattern", r"^(?P<major_code>[0-9A-Za-z]{2})\s*(?P<major_name>.+)$")))
+    course_pattern = re.compile(str(profile.get("course_pattern", r"^(历史类|物理类)$")))
+    subject_pattern = re.compile(str(profile.get("subject_pattern", r"再选\s*[:：]\s*(.+)$")))
+    critical_score = float(profile.get("minimum_critical_ocr_score", 0.0))
+
+    current_course = ""
+    current_subject = ""
+    current_group: dict[str, Any] | None = None
+    current_major: dict[str, Any] | None = None
+    group_had_major = False
+    visual_row_number = 0
+
+    def normalize_current_group() -> None:
+        if current_group is None or current_group.get("院校专业组代码"):
+            return
+        combined = str(current_group.get("院校代码", "")) + str(
+            current_group.get("院校名称", "")
+        )
+        match = school_pattern.fullmatch(combined)
+        recovered = False
+        if not match:
+            match = school_recovery_pattern.fullmatch(combined)
+            recovered = match is not None
+        if not match:
+            return
+        institution_code = match.group("institution_code")
+        institution_name = match.group("institution_name").strip()
+        group_code = match.group("group_code")
+        group_name = match.group("group_name").strip()
+        embedded_plan = match.groupdict().get("embedded_plan", "") if recovered else ""
+        current_group.update(
+            {
+                "院校代码": institution_code,
+                "院校名称": institution_name,
+                "院校专业组代码": institution_code + group_code,
+                "专业组代码": group_code,
+                "院校专业组名称": f"{institution_name} 第{group_code}组({group_name})",
+            }
+        )
+        if embedded_plan and not str(current_group.get("\u4e13\u4e1a\u7ec4\u8ba1\u5212\u6570", "")).strip():
+            current_group["\u4e13\u4e1a\u7ec4\u8ba1\u5212\u6570"] = embedded_plan
+        current_group["issues"] = [
+            issue
+            for issue in current_group.get("issues", [])
+            if issue != "院校专业组结构未完整识别"
+        ]
+
+    def numeric_values(
+        row: list[Token], page: ExtractedPage, side_config: dict[str, Any]
+    ) -> tuple[str, str, float]:
+        selected = _tokens_in_x_band(row, page.width, side_config["numeric"])
+        found: list[tuple[str, float, float]] = []
+        for token in selected:
+            for value in re.findall(r"\d+", token.text):
+                found.append((value, token.cx / page.width, token.score))
+        if not found:
+            return "", "", 1.0
+        confidence = min(item[2] for item in found)
+        if len(found) >= 2:
+            return found[0][0], found[-1][0], confidence
+        value, center, _ = found[0]
+        if value.isdigit() and 4 <= len(value) <= 6:
+            return value[:-3], value[-3:], confidence
+        if center >= float(side_config["score_split"]):
+            return "", value, confidence
+        return value, "", confidence
+
+    def split_major_details(value: str) -> tuple[str, str, str, str]:
+        tuition_match = re.search(r"学费\s*[:：]\s*(\d{3,6})\s*元", value)
+        duration_match = re.search(r"学制\s*[:：]?\s*(\d+)\s*年", value)
+        if duration_match:
+            duration = duration_match.group(1)
+        else:
+            chinese_duration = re.search(r"学制\s*([一二三四五六七八九十])\s*年", value)
+            duration_map = {
+                "一": "1", "二": "2", "三": "3", "四": "4", "五": "5",
+                "六": "6", "七": "7", "八": "8", "九": "9", "十": "10",
+            }
+            duration = duration_map.get(chinese_duration.group(1), "") if chinese_duration else ""
+        detail_match = re.search(r"[（(]学(?:费|制)", value)
+        if detail_match:
+            name = value[: detail_match.start()].strip()
+            note = value[detail_match.start() :].strip()
+        else:
+            name = value.strip()
+            note = ""
+        return name, duration, tuition_match.group(1) if tuition_match else "", note
+
+    def finalize_major() -> None:
+        nonlocal current_major, group_had_major
+        if current_major is None:
+            return
+        normalize_current_group()
+        group = current_group or {}
+        name, duration, tuition, note = split_major_details(
+            str(current_major["专业描述"])
+        )
+        values: dict[str, Any] = {
+            **context,
+            "科类": current_major["科类"],
+            "科目要求": current_major["再选科目"],
+            "再选科目": current_major["再选科目"],
+            "院校代码": group.get("院校代码", ""),
+            "院校名称": group.get("院校名称", ""),
+            "院校专业组代码": group.get("院校专业组代码", ""),
+            "专业组代码": group.get("专业组代码", ""),
+            "院校专业组名称": group.get("院校专业组名称", ""),
+            "专业组计划数": group.get("专业组计划数", ""),
+            "专业代码": current_major["专业代码"],
+            "专业名称及专业方向": name,
+            "计划数": current_major["计划数"],
+            "分数线": current_major["分数线"],
+            "学制": duration,
+            "学费": tuition,
+            "备注": note,
+            "来源文件": current_major["来源文件"],
+            "来源页": current_major["来源页"],
+            "来源行": current_major["来源行"],
+            "提取方式": current_major["提取方式"],
+            "原始行文本": current_major["原始行文本"],
+            "_major_side": current_major["_major_side"],
+            "_major_page": current_major["_major_page"],
+            "_major_y1": current_major["_major_y1"],
+            "_major_y2": current_major["_major_y2"],
+            "_group_side": group.get("_group_side", ""),
+            "_group_page": group.get("_group_page", ""),
+            "_group_y1": group.get("_group_y1", ""),
+            "_group_y2": group.get("_group_y2", ""),
+        }
+        issues = list(group.get("issues", [])) + list(current_major["issues"])
+        for field in required:
+            if not str(values.get(field, "")).strip():
+                issues.append(f"缺少必填字段：{field}")
+        for field in integer_fields:
+            value = str(values.get(field, "")).strip()
+            if value and not re.fullmatch(r"\d+", value):
+                issues.append(f"{field}：应为整数（{value}）")
+        score = str(values.get("分数线", "")).strip()
+        if score.isdigit() and not 0 <= int(score) <= 750:
+            issues.append(f"分数线：超出合理范围（{score}）")
+        records.append(ParsedRecord(values=values, issues=list(dict.fromkeys(issues))))
+        group_had_major = True
+        current_major = None
+
+    def add_orphan_group_issue() -> None:
+        normalize_current_group()
+        if current_group is None or group_had_major:
+            return
+        values = {
+            **context,
+            "科类": current_course,
+            "科目要求": current_subject,
+            "再选科目": current_subject,
+            **current_group,
+            "专业代码": "",
+            "专业名称及专业方向": "",
+            "计划数": "",
+            "分数线": "",
+            "学制": "",
+            "学费": "",
+            "备注": "",
+        }
+        records.append(ParsedRecord(values=values, issues=["识别到院校专业组，但未识别到专业行"]))
+
+    for page in pages:
+        for side in ("left", "right"):
+            side_config = regions[side]
+            side_min, side_max = (float(value) for value in side_config["page"])
+            side_tokens = [
+                token
+                for token in page.tokens
+                if side_min <= token.x1 / page.width < side_max
+            ]
+            for row in _cluster_rows(side_tokens, y_tolerance_ratio):
+                visual_row_number += 1
+                joined_row = _join_tokens(row)
+                if not joined_row:
+                    continue
+                context_row = False
+                course_match = course_pattern.search(joined_row)
+                if course_match and not re.match(r"\d", joined_row):
+                    current_course = course_match.group(1)
+                    context_row = True
+                subject_match = subject_pattern.search(joined_row)
+                if subject_match:
+                    current_subject = subject_match.group(1).strip()
+                    context_row = True
+                if context_row:
+                    continue
+                if any(marker in joined_row for marker in skip_markers):
+                    continue
+                description_tokens = _tokens_in_x_band(
+                    row, page.width, side_config["description"]
+                )
+                description = _join_tokens(description_tokens)
+                if not description:
+                    continue
+                plan, score, numeric_confidence = numeric_values(row, page, side_config)
+
+                school_match = school_pattern.fullmatch(description)
+                if school_match:
+                    finalize_major()
+                    add_orphan_group_issue()
+                    institution_code = school_match.group("institution_code")
+                    institution_name = school_match.group("institution_name").strip()
+                    group_code = school_match.group("group_code")
+                    group_name = school_match.group("group_name").strip()
+                    issues: list[str] = []
+                    if critical_score and min(token.score for token in description_tokens) < critical_score:
+                        issues.append("院校专业组行 OCR 置信度较低")
+                    current_group = {
+                        "院校代码": institution_code,
+                        "院校名称": institution_name,
+                        "院校专业组代码": institution_code + group_code,
+                        "专业组代码": group_code,
+                        "院校专业组名称": f"{institution_name} 第{group_code}组({group_name})",
+                        "专业组计划数": plan,
+                        "来源文件": page.source_relative_path,
+                        "来源页": str(page.page_number),
+                        "来源行": str(visual_row_number),
+                        "提取方式": page.method,
+                        "原始行文本": joined_row,
+                        "issues": issues,
+                        "_group_side": side,
+                        "_group_page": page.page_number,
+                        "_group_y1": min(token.y1 for token in row),
+                        "_group_y2": max(token.y2 for token in row),
+                    }
+                    group_had_major = False
+                    continue
+
+                fallback_match = school_fallback_pattern.fullmatch(description)
+                looks_like_wrapped_numeric_note = bool(
+                    re.match(r"^\d{4,6}(?:元|年|/)", description)
+                )
+                if fallback_match and not looks_like_wrapped_numeric_note:
+                    finalize_major()
+                    add_orphan_group_issue()
+                    institution_code = fallback_match.group("institution_code")
+                    institution_name = fallback_match.group("institution_name").strip()
+                    current_group = {
+                        "院校代码": institution_code,
+                        "院校名称": institution_name,
+                        "院校专业组代码": "",
+                        "专业组代码": "",
+                        "院校专业组名称": "",
+                        "专业组计划数": plan,
+                        "来源文件": page.source_relative_path,
+                        "来源页": str(page.page_number),
+                        "来源行": str(visual_row_number),
+                        "提取方式": page.method,
+                        "原始行文本": joined_row,
+                        "issues": ["院校专业组结构未完整识别"],
+                        "_group_side": side,
+                        "_group_page": page.page_number,
+                        "_group_y1": min(token.y1 for token in row),
+                        "_group_y2": max(token.y2 for token in row),
+                    }
+                    group_had_major = False
+                    continue
+
+                if not plan and score:
+                    trailing_plan = re.fullmatch(r"(.+?)\s+(\d{1,3})", description)
+                    if trailing_plan:
+                        description = trailing_plan.group(1).strip()
+                        plan = trailing_plan.group(2)
+                major_match = major_pattern.fullmatch(description)
+                if major_match and (plan or score):
+                    finalize_major()
+                    normalize_current_group()
+                    issues = []
+                    if current_group is None:
+                        issues.append("专业行之前未识别到所属院校专业组")
+                    if critical_score and numeric_confidence < critical_score:
+                        issues.append("计划数或分数线 OCR 置信度较低")
+                    current_major = {
+                        "专业代码": major_match.group("major_code"),
+                        "专业描述": major_match.group("major_name").strip(),
+                        "科类": current_course,
+                        "再选科目": current_subject,
+                        "计划数": plan,
+                        "分数线": score,
+                        "来源文件": page.source_relative_path,
+                        "来源页": str(page.page_number),
+                        "来源行": str(visual_row_number),
+                        "提取方式": page.method,
+                        "原始行文本": joined_row,
+                        "issues": issues,
+                        "_major_side": side,
+                        "_major_page": page.page_number,
+                        "_major_y1": min(token.y1 for token in row),
+                        "_major_y2": max(token.y2 for token in row),
+                    }
+                    continue
+
+                if current_major is not None:
+                    current_major["专业描述"] += description
+                    current_major["原始行文本"] += " | " + joined_row
+                elif current_group is not None:
+                    current_group["院校名称"] += description
+                    current_group["原始行文本"] += " | " + joined_row
+                    normalize_current_group()
+
+    finalize_major()
+    add_orphan_group_issue()
+
+    grouped: dict[tuple[str, str], list[ParsedRecord]] = {}
+    for record in records:
+        key = (
+            str(record.values.get("来源文件", "")),
+            str(record.values.get("院校专业组代码", "")),
+        )
+        grouped.setdefault(key, []).append(record)
+    for group_records in grouped.values():
+        expected = str(group_records[0].values.get("专业组计划数", "")).strip()
+        plans = [str(record.values.get("计划数", "")).strip() for record in group_records]
+        if expected.isdigit() and plans and all(plan.isdigit() for plan in plans):
+            actual = sum(int(plan) for plan in plans)
+            if actual != int(expected):
+                issue = f"专业计划数合计 {actual} 与专业组计划数 {expected} 不一致"
+                for record in group_records:
+                    if issue not in record.issues:
+                        record.issues.append(issue)
+    return records
+
+
 def parse_hierarchical_group_major_plan(
     pages: list[ExtractedPage],
     profile: dict[str, Any],
@@ -834,11 +1181,46 @@ def recheck_plan_totals(records: list[ParsedRecord]) -> None:
         record.issues = [
             issue for issue in record.issues if not issue.startswith(mismatch_prefix)
         ]
-    grouped: dict[tuple[str, str], list[ParsedRecord]] = {}
+
+    grouped: dict[tuple[str, str, str, str], list[ParsedRecord]] = {}
+    ungrouped: dict[tuple[str, str], list[ParsedRecord]] = {}
     for record in records:
-        key = (str(record.values.get("来源文件", "")), str(record.values.get("院校代码", "")))
-        grouped.setdefault(key, []).append(record)
-    for school_records in grouped.values():
+        source = str(record.values.get("来源文件", ""))
+        group_code = str(record.values.get("院校专业组代码", "")).strip()
+        if group_code:
+            key = (
+                source,
+                str(record.values.get("科类", "")).strip(),
+                str(
+                    record.values.get("再选科目", "")
+                    or record.values.get("科目要求", "")
+                ).strip(),
+                group_code,
+            )
+            grouped.setdefault(key, []).append(record)
+            continue
+        school_code = str(record.values.get("院校代码", "")).strip()
+        if school_code:
+            ungrouped.setdefault((source, school_code), []).append(record)
+
+    for group_records in grouped.values():
+        expected = next(
+            (
+                str(record.values.get("专业组计划数", "")).strip()
+                for record in group_records
+                if str(record.values.get("专业组计划数", "")).strip()
+            ),
+            "",
+        )
+        plans = [str(record.values.get("计划数", "")).strip() for record in group_records]
+        if expected.isdigit() and plans and all(plan.isdigit() for plan in plans):
+            actual = sum(int(plan) for plan in plans)
+            if actual != int(expected):
+                issue = f"专业计划数合计 {actual} 与专业组计划数 {expected} 不一致"
+                for record in group_records:
+                    record.issues.append(issue)
+
+    for school_records in ungrouped.values():
         expected = str(school_records[0].values.get("院校计划总数", "")).strip()
         plans = [str(record.values.get("计划数", "")).strip() for record in school_records]
         if expected.isdigit() and plans and all(plan.isdigit() for plan in plans):
@@ -860,6 +1242,10 @@ def parse_pages(
         )
     if parser_name == "two_column_hierarchical_plan":
         return parse_two_column_hierarchical_plan(
+            pages, profile, y_tolerance_ratio=y_tolerance_ratio
+        )
+    if parser_name == "two_column_plan_balance_score":
+        return parse_two_column_plan_balance_score(
             pages, profile, y_tolerance_ratio=y_tolerance_ratio
         )
     if parser_name == "hierarchical_group_major_plan":

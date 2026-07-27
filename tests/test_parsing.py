@@ -1,9 +1,11 @@
-from admission_pipeline.domain import ExtractedPage, Token
+from admission_pipeline.domain import ExtractedPage, ParsedRecord, Token
 from admission_pipeline.parsing import (
     _strip_cjk_noise_from_typed_value,
     parse_spatial_rows,
     parse_structured_table,
     parse_two_column_hierarchical_plan,
+    parse_two_column_plan_balance_score,
+    recheck_plan_totals,
 )
 
 
@@ -149,3 +151,134 @@ def test_structured_table_uses_cells_and_section_context() -> None:
     assert records[0].values["计划类别"] == "国家及地方专项"
     assert records[0].values["省份"] == "新疆"
     assert not records[0].issues
+
+
+def test_two_column_plan_balance_score_parses_group_major_and_context() -> None:
+    page = ExtractedPage(
+        source_relative_path="henan/2026/demo.pdf",
+        source_sha256="abc",
+        page_number=2,
+        method="pdf_page_ocr",
+        width=1000,
+        height=1400,
+        tokens=[
+            Token("历史类", 0.99, 180, 50, 260, 75),
+            Token("再选：不限", 0.99, 360, 80, 450, 105),
+            Token("1435 北京语言大学 第G15组(高校专项计划组)", 0.99, 55, 120, 350, 145),
+            Token("1", 0.99, 430, 120, 445, 145),
+            Token("19 外国语言文学类(英语和翻译)(学费：6000元/年)", 0.99, 65, 160, 410, 185),
+            Token("1 594", 0.99, 430, 160, 490, 185),
+            Token("物理类", 0.99, 650, 50, 730, 75),
+            Token("再选：生物", 0.99, 820, 80, 900, 105),
+            Token("2440 长江大学 第111", 0.99, 515, 120, 790, 145),
+            Token("1", 0.99, 880, 120, 895, 145),
+            Token("组(普通组)", 0.99, 535, 150, 650, 175),
+            Token("58 中西医临床医学(学制五年)(学费：5850元/年)", 0.99, 525, 190, 850, 215),
+            Token("1419", 0.99, 880, 190, 970, 215),
+        ],
+    )
+    profile = {
+        "page_regions": {
+            "left": {
+                "page": [0.0, 0.5], "description": [0.05, 0.42],
+                "numeric": [0.42, 0.5], "score_split": 0.455,
+            },
+            "right": {
+                "page": [0.5, 1.0], "description": [0.51, 0.86],
+                "numeric": [0.86, 1.0], "score_split": 0.915,
+            },
+        },
+        "school_pattern": r"^(?P<institution_code>\d{4})\s*(?P<institution_name>.+?)\s*第(?P<group_code>[0-9A-Za-z]{3})组[（(](?P<group_name>.+?)[）)]$",
+        "major_pattern": r"^(?P<major_code>[0-9A-Za-z]{2})\s*(?P<major_name>.+)$",
+        "course_pattern": r"^(历史类|物理类)$",
+        "subject_pattern": r"再选\s*[:：]\s*(.+)$",
+        "required": ["科类", "再选科目", "院校代码", "院校专业组代码", "专业代码", "计划数", "分数线"],
+        "integer_fields": ["专业组计划数", "计划数", "分数线"],
+    }
+    records = parse_two_column_plan_balance_score(
+        [page], profile, y_tolerance_ratio=0.65
+    )
+    assert len(records) == 2
+    assert records[0].values["院校专业组代码"] == "1435G15"
+    assert records[0].values["科类"] == "历史类"
+    assert records[0].values["再选科目"] == "不限"
+    assert records[0].values["专业名称及专业方向"] == "外国语言文学类(英语和翻译)"
+    assert records[0].values["学费"] == "6000"
+    assert records[0].values["分数线"] == "594"
+    assert records[1].values["科类"] == "物理类"
+    assert records[1].values["再选科目"] == "生物"
+    assert records[1].values["学制"] == "5"
+    assert records[1].values["计划数"] == "1"
+    assert records[1].values["分数线"] == "419"
+    assert not records[0].issues
+    assert not records[1].issues
+
+
+def test_two_column_balance_parser_recovers_right_edge_group_with_embedded_plan() -> None:
+    page = ExtractedPage(
+        source_relative_path="henan/2026/demo.pdf",
+        source_sha256="abc",
+        page_number=1,
+        method="pdf_page_ocr",
+        width=1000,
+        height=1400,
+        tokens=[
+            Token("\u7269\u7406\u7c7b", 0.99, 600, 40, 680, 65),
+            Token("\u518d\u9009\uff1a\u5316\u5b66", 0.99, 800, 70, 900, 95),
+            Token("6605 \u6d4b\u8bd5\u5b66\u9662 \u7b2c101 52\u7ec4(\u666e\u901a\u7ec4)", 0.99, 500, 120, 850, 145),
+            Token("01 \u8ba1\u7b97\u673a\u79d1\u5b66\u4e0e\u6280\u672f(\u5b66\u8d39\uff1a29000\u5143/\u5e74)", 0.99, 520, 160, 850, 185),
+            Token("5 389", 0.99, 880, 160, 970, 185),
+        ],
+    )
+    profile = {
+        "page_regions": {
+            "left": {
+                "page": [0.0, 0.5], "description": [0.05, 0.42],
+                "numeric": [0.42, 0.5], "score_split": 0.455,
+            },
+            "right": {
+                "page": [0.5, 1.0], "description": [0.5, 0.86],
+                "numeric": [0.86, 1.0], "score_split": 0.915,
+            },
+        },
+        "school_pattern": r"^(?P<institution_code>\d{4})\s*(?P<institution_name>.+?)\s*\u7b2c(?P<group_code>[0-9A-Za-z]{3})\u7ec4[\uff08(](?P<group_name>.+?)[\uff09)]$",
+        "major_pattern": r"^(?P<major_code>[0-9A-Za-z]{2})\s*(?P<major_name>.+)$",
+        "course_pattern": r"(\u5386\u53f2\u7c7b|\u7269\u7406\u7c7b)",
+        "subject_pattern": r"\u518d\u9009\s*[:\uff1a]\s*(.+)$",
+        "required": ["\u79d1\u7c7b", "\u518d\u9009\u79d1\u76ee", "\u9662\u6821\u4ee3\u7801", "\u9662\u6821\u4e13\u4e1a\u7ec4\u4ee3\u7801", "\u4e13\u4e1a\u4ee3\u7801", "\u8ba1\u5212\u6570", "\u5206\u6570\u7ebf"],
+        "integer_fields": ["\u4e13\u4e1a\u7ec4\u8ba1\u5212\u6570", "\u8ba1\u5212\u6570", "\u5206\u6570\u7ebf"],
+    }
+
+    records = parse_two_column_plan_balance_score(
+        [page], profile, y_tolerance_ratio=0.65
+    )
+
+    assert len(records) == 1
+    assert records[0].values["\u9662\u6821\u4e13\u4e1a\u7ec4\u4ee3\u7801"] == "6605101"
+    assert records[0].values["\u4e13\u4e1a\u7ec4\u8ba1\u5212\u6570"] == "52"
+    assert records[0].values["\u4e13\u4e1a\u4ee3\u7801"] == "01"
+    assert records[0].values["\u8ba1\u5212\u6570"] == "5"
+    assert records[0].values["\u5206\u6570\u7ebf"] == "389"
+
+
+def test_group_total_recheck_keeps_reused_group_codes_separate_by_context() -> None:
+    records = [
+        ParsedRecord(values={
+            "来源文件": "demo.pdf", "科类": "历史类", "再选科目": "地理",
+            "院校专业组代码": "6800102", "专业组计划数": "5", "计划数": "5",
+        }),
+        ParsedRecord(values={
+            "来源文件": "demo.pdf", "科类": "物理类", "再选科目": "地理",
+            "院校专业组代码": "6800102", "专业组计划数": "1", "计划数": "1",
+        }),
+        ParsedRecord(values={
+            "来源文件": "demo.pdf", "科类": "物理类", "再选科目": "化学",
+            "院校专业组代码": "9999101", "专业组计划数": "2", "计划数": "1",
+        }),
+    ]
+
+    recheck_plan_totals(records)
+
+    assert not records[0].issues
+    assert not records[1].issues
+    assert records[2].issues == ["专业计划数合计 1 与专业组计划数 2 不一致"]
