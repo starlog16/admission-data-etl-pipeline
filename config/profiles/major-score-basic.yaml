@@ -1,0 +1,52 @@
+name: major-score-basic
+description: 一行一个专业的投档表；通过动态表头识别院校、专业、投档数、最低分和位次。
+priority: 111
+match:
+  text_contains: [招考类型, 投档数, 最低分, 低位次]
+parser: structured_table
+dynamic_header_mapping: true
+header_aliases: standard
+header_fields:
+  - 序号
+  - 院校代码
+  - 院校名称
+  - 专业代码
+  - 专业名称及专业方向
+  - 招考类型
+  - 投档人数
+  - 最低分
+  - 最低分名次
+required_header_fields:
+  - 序号
+  - 院校代码
+  - 院校名称
+  - 专业代码
+  - 专业名称及专业方向
+  - 投档人数
+  - 最低分
+  - 最低分名次
+constants:
+  数据类型: 投档数据
+  招生类型: 征集志愿
+context_patterns:
+  批次: '(?P<value>普通类本科批)'
+row_key: {field: 序号, pattern: '\d+'}
+required: [院校代码, 院校名称, 专业代码, 专业名称及专业方向, 投档人数]
+integer_fields: [序号, 投档人数, 最低分, 最低分名次]
+code_fields: [院校代码, 专业代码]
+conditional_required:
+  - field: 投档人数
+    pattern: '[1-9]\d*'
+    required: [最低分, 最低分名次]
+    message: '已有投档人数但缺少关键投档字段：'
+conditional_warnings:
+  - field: 投档人数
+    pattern: '0'
+    message: '投档人数为0，源表最低分和最低位次为空；保留在data并记录审计。'
+split_merged_rows:
+  anchor_field: 专业代码
+  anchor_pattern: '[0-9A-Za-z]{2,4}'
+  fields: [专业代码, 专业名称及专业方向, 招考类型, 投档人数, 最低分, 最低分名次]
+  repeat_fields: [招考类型]
+skip_if_contains: []
+review_all: false

@@ -3,17 +3,18 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
 from .config import ProjectConfig, load_profiles
-from .domain import ParsedRecord
+from .domain import ParseDiagnostics, ParsedRecord
 from .exporting import export_workbook
 from .extraction import ExtractionEngine
 from .inventory import inventory, resolve_input_target
 from .parsing import parse_pages, recheck_plan_totals
 from .profiles import select_profile
-from .refinement import refine_missing_numeric_cells
+from .refinement import apply_verified_record_corrections, refine_missing_numeric_cells
 from .validation import validate_records
 
 
@@ -45,6 +46,7 @@ def process(
     if mode not in {"extract", "check", "run"}:
         raise ValueError(f"未知运行模式：{mode}")
     started_at = datetime.now().isoformat(timespec="seconds")
+    process_started = perf_counter()
     target = resolve_input_target(config, user_input)
     files = inventory(config, target)
     profiles = load_profiles(config)
@@ -53,20 +55,33 @@ def process(
     records_by_profile: dict[str, int] = {}
     used_profiles: dict[str, dict[str, Any]] = {}
     file_reports: list[dict[str, Any]] = []
+    stage_totals = {
+        "extract": 0.0,
+        "profile": 0.0,
+        "parse": 0.0,
+        "refine_and_validate": 0.0,
+    }
 
     for item in files:
+        file_started = perf_counter()
+        stage_started = perf_counter()
         pages = engine.extract(item, use_cache=use_cache, force_ocr=force_ocr)
+        extract_seconds = perf_counter() - stage_started
+        stage_totals["extract"] += extract_seconds
         document_text = "\n".join(
             page.plain_text
             or " ".join(token.text for token in page.tokens if token.text.strip())
             for page in pages
         )
+        stage_started = perf_counter()
         profile = select_profile(
             profiles,
             item.relative_path,
             requested_profile,
             document_text,
         )
+        profile_seconds = perf_counter() - stage_started
+        stage_totals["profile"] += profile_seconds
         file_report: dict[str, Any] = {
             "source": item.relative_path.as_posix(),
             "kind": item.kind,
@@ -77,18 +92,37 @@ def process(
             "cache_hit": engine.last_cache_hit,
         }
         if mode in {"check", "run"}:
+            diagnostics = ParseDiagnostics(parser=str(profile.get("parser", "")))
+            stage_started = perf_counter()
             records = parse_pages(
                 pages,
                 profile,
                 y_tolerance_ratio=float(config.parsing["row_y_tolerance_ratio"]),
+                source_path=item.path,
+                cell_ocr_cache_root=(
+                    config.path("temp_root") / "cache" / "grid_cell_ocr"
+                ),
+                diagnostics=diagnostics,
             )
+            parse_seconds = perf_counter() - stage_started
+            stage_totals["parse"] += parse_seconds
+            stage_started = perf_counter()
             if (profile.get("cell_ocr_refinement") or {}).get("enabled", False):
                 records = refine_missing_numeric_cells(
                     config, item, pages, records, profile, engine.ocr
                 )
+            records = apply_verified_record_corrections(records, profile)
             recheck_plan_totals(records)
             for record in records:
                 record.values["版式"] = profile["name"]
+            if not diagnostics.coverage_observable:
+                diagnostics.records_emitted = len(records)
+                diagnostics.notes.append(
+                    "该解析器尚不能从版面独立计数源记录；不得把输出行数当作完整率。"
+                )
+            diagnostics.assert_complete()
+            refine_seconds = perf_counter() - stage_started
+            stage_totals["refine_and_validate"] += refine_seconds
             all_records.extend(records)
             records_by_profile[profile["name"]] = (
                 records_by_profile.get(profile["name"], 0) + len(records)
@@ -96,11 +130,26 @@ def process(
             used_profiles[profile["name"]] = profile
             file_report["records"] = len(records)
             file_report["review_records"] = sum(record.needs_review for record in records)
+            file_report["warning_records"] = sum(bool(record.warnings) for record in records)
+            file_report["parse_diagnostics"] = diagnostics.to_dict()
+            file_report["timings_seconds"] = {
+                "extract": round(extract_seconds, 4),
+                "profile": round(profile_seconds, 4),
+                "parse": round(parse_seconds, 4),
+                "refine_and_validate": round(refine_seconds, 4),
+                "total": round(perf_counter() - file_started, 4),
+            }
             file_report["review_examples"] = [
                 {"issues": record.issues, "values": record.values}
                 for record in records
                 if record.needs_review
             ][:3]
+        else:
+            file_report["timings_seconds"] = {
+                "extract": round(extract_seconds, 4),
+                "profile": round(profile_seconds, 4),
+                "total": round(perf_counter() - file_started, 4),
+            }
         file_reports.append(file_report)
 
     report: dict[str, Any] = {
@@ -115,6 +164,24 @@ def process(
         summary = validate_records(all_records, "aggregate")
         summary["profiles"] = records_by_profile
         summary["source_file_count"] = len(files)
+        _add_coverage_release_gate(summary, file_reports, len(files))
+        diagnostics_items = [
+            item["parse_diagnostics"]
+            for item in file_reports
+            if item.get("parse_diagnostics")
+        ]
+        summary["cell_ocr"] = {
+            "cache_hits": sum(
+                int(item.get("cell_ocr_cache_hits", 0)) for item in diagnostics_items
+            ),
+            "cache_misses": sum(
+                int(item.get("cell_ocr_cache_misses", 0)) for item in diagnostics_items
+            ),
+            "semantic_reuse": sum(
+                int(item.get("cell_ocr_semantic_reuse", 0))
+                for item in diagnostics_items
+            ),
+        }
         report["summary"] = summary
 
     if mode == "run":
@@ -126,6 +193,12 @@ def process(
                 "发现未验证版式，已停止生成 Excel："
                 + "、".join(unverified_profiles)
                 + "。请先新增或修正版式 YAML，再重新运行。"
+            )
+        if not bool(summary.get("release_safe", False)):
+            raise RuntimeError(
+                "质量保护触发："
+                + "；".join(str(value) for value in summary.get("release_blockers", []))
+                + "。已停止生成 Excel。"
             )
         output_path = _aggregate_output_path(config, target)
         if output_path.exists() and not overwrite and not archive_existing:
@@ -164,9 +237,42 @@ def process(
         report["outputs"].append({"path": str(output_path), "summary": summary})
 
     report["finished_at"] = datetime.now().isoformat(timespec="seconds")
+    report["timings_seconds"] = {
+        **{key: round(value, 4) for key, value in stage_totals.items()},
+        "total": round(perf_counter() - process_started, 4),
+    }
     report_path = _write_report(config, report, target.name)
     report["report_path"] = str(report_path)
     return report
+
+
+def _add_coverage_release_gate(
+    summary: dict[str, Any],
+    file_reports: list[dict[str, Any]],
+    source_file_count: int,
+) -> None:
+    observable = [
+        item["parse_diagnostics"]
+        for item in file_reports
+        if item.get("parse_diagnostics", {}).get("coverage_observable")
+    ]
+    unobservable_file_count = source_file_count - len(observable)
+    summary["coverage"] = {
+        "observable_file_count": len(observable),
+        "unobservable_file_count": unobservable_file_count,
+        "source_units_detected": sum(
+            int(item["source_units_detected"]) for item in observable
+        ),
+        "records_emitted": sum(int(item["records_emitted"]) for item in observable),
+        "recovered_units": sum(int(item["recovered_units"]) for item in observable),
+        "unparsed_units": sum(int(item["unparsed_units"]) for item in observable),
+    }
+    if unobservable_file_count:
+        summary["release_safe"] = False
+        blockers = summary.setdefault("release_blockers", [])
+        blockers.append(
+            f"{unobservable_file_count}个源文件的解析器尚不能独立证明完整率"
+        )
 
 
 def _aggregate_output_path(config: ProjectConfig, target: Path) -> Path:

@@ -7,6 +7,7 @@ from admission_pipeline.exporting import export_workbook
 from admission_pipeline.domain import ParsedRecord
 from openpyxl import load_workbook
 from admission_pipeline.pipeline import (
+    _add_coverage_release_gate,
     _aggregate_output_path,
     _archive_existing_output,
     _unverified_profile_names,
@@ -57,6 +58,7 @@ def test_daily_output_is_compact() -> None:
             "summary": {
                 "record_count": 10,
                 "review_count": 1,
+                "warning_count": 2,
                 "duplicate_count": 0,
                 "profiles": {"demo": 10},
             },
@@ -66,7 +68,24 @@ def test_daily_output_is_compact() -> None:
     )
     assert compact["cache_hit_count"] == 1
     assert compact["new_extraction_count"] == 1
+    assert compact["warning_count"] == 2
     assert "files" not in compact
+
+
+def test_warning_only_records_stay_in_data_and_are_repeated_in_audit(tmp_path: Path) -> None:
+    output = tmp_path / "audit.xlsx"
+    record = ParsedRecord(
+        values={"院校代码": "0001", "投档人数": "0"},
+        warnings=["零投档"],
+    )
+    export_workbook(output, [record], {"record_count": 1}, ["院校代码"])
+    workbook = load_workbook(output, read_only=True)
+    try:
+        assert workbook["data"].max_row == 2
+        assert workbook["audit"].max_row == 2
+        assert "review" not in workbook.sheetnames
+    finally:
+        workbook.close()
 
 
 def test_existing_output_is_archived_without_overwrite(tmp_path: Path) -> None:
@@ -94,6 +113,27 @@ def test_unknown_profile_blocks_final_export() -> None:
             "generic": {"name": "generic-review", "review_all": True},
         }
     ) == ["generic-review"]
+
+
+def test_unobservable_parser_blocks_formal_release() -> None:
+    summary = {"release_safe": True, "release_blockers": []}
+    reports = [
+        {
+            "parse_diagnostics": {
+                "coverage_observable": False,
+                "source_units_detected": 0,
+                "records_emitted": 10,
+                "recovered_units": 0,
+                "unparsed_units": 0,
+            }
+        }
+    ]
+
+    _add_coverage_release_gate(summary, reports, 1)
+
+    assert not summary["release_safe"]
+    assert summary["coverage"]["unobservable_file_count"] == 1
+    assert "尚不能独立证明完整率" in summary["release_blockers"][0]
 
 
 def test_hierarchical_output_adds_group_and_institution_summaries(tmp_path: Path) -> None:
@@ -137,5 +177,53 @@ def test_export_serializes_visible_container_values(tmp_path: Path) -> None:
     workbook = load_workbook(output, read_only=True)
     try:
         assert workbook["data"].cell(row=2, column=2).value == "[]"
+    finally:
+        workbook.close()
+
+
+def test_review_output_contains_grouped_cases_and_field_evidence(tmp_path: Path) -> None:
+    output = tmp_path / "review.xlsx"
+    records = [
+        ParsedRecord(
+            values={
+                "来源文件": "fujian/demo.pdf",
+                "来源页": 2,
+                "院校代码": "1906",
+                "院校名称": "福州理工学院",
+                "专业代码": code,
+                "_field_evidence": {
+                    "院校代码": {
+                        "raw_value": "1906",
+                        "raw_confidence": 0.68,
+                        "cell_value": "",
+                        "cell_confidence": 0.0,
+                        "final_value": "1906",
+                        "status": "unresolved",
+                    }
+                },
+            },
+            issues=["院校代码网格单元格双路复识未达可信阈值"],
+        )
+        for code in ("021", "023")
+    ]
+
+    export_workbook(output, records, {"record_count": 2}, ["院校代码", "专业代码"])
+    workbook = load_workbook(output, read_only=True)
+    try:
+        assert workbook["data"].max_row == 1
+        assert workbook["review"].max_row == 3
+        assert workbook["review_cases"].max_row == 2
+        headers = {cell.value: cell.column for cell in workbook["review"][1]}
+        evidence = workbook["review"].cell(
+            row=2, column=headers["关键字段证据"]
+        ).value
+        assert "raw=1906" in evidence
+        assert "status=unresolved" in evidence
+        case_headers = {
+            cell.value: cell.column for cell in workbook["review_cases"][1]
+        }
+        assert workbook["review_cases"].cell(
+            row=2, column=case_headers["影响记录数"]
+        ).value == 2
     finally:
         workbook.close()

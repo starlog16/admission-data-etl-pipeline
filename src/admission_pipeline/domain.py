@@ -73,7 +73,64 @@ class ExtractedPage:
 class ParsedRecord:
     values: dict[str, Any]
     issues: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def needs_review(self) -> bool:
         return bool(self.issues)
+
+    @property
+    def needs_audit(self) -> bool:
+        return bool(self.warnings) and not self.needs_review
+
+    @property
+    def quality_bucket(self) -> str:
+        if self.needs_review:
+            return "review"
+        if self.needs_audit:
+            return "audit"
+        return "data"
+
+
+@dataclass(slots=True)
+class ParseDiagnostics:
+    parser: str
+    coverage_observable: bool = False
+    source_units_detected: int = 0
+    records_emitted: int = 0
+    recovered_units: int = 0
+    unparsed_units: int = 0
+    cell_ocr_cache_hits: int = 0
+    cell_ocr_cache_misses: int = 0
+    cell_ocr_semantic_reuse: int = 0
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def coverage_ratio(self) -> float | None:
+        if not self.coverage_observable or self.source_units_detected == 0:
+            return None
+        return self.records_emitted / self.source_units_detected
+
+    def assert_complete(self) -> None:
+        if not self.coverage_observable:
+            return
+        if self.unparsed_units or self.records_emitted != self.source_units_detected:
+            raise RuntimeError(
+                f"解析完整性保护触发：检测到 {self.source_units_detected} 个源数据单元，"
+                f"输出 {self.records_emitted} 条，未保留 {self.unparsed_units} 条。"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "parser": self.parser,
+            "coverage_observable": self.coverage_observable,
+            "source_units_detected": self.source_units_detected,
+            "records_emitted": self.records_emitted,
+            "recovered_units": self.recovered_units,
+            "unparsed_units": self.unparsed_units,
+            "coverage_ratio": self.coverage_ratio,
+            "cell_ocr_cache_hits": self.cell_ocr_cache_hits,
+            "cell_ocr_cache_misses": self.cell_ocr_cache_misses,
+            "cell_ocr_semantic_reuse": self.cell_ocr_semantic_reuse,
+            "notes": list(self.notes),
+        }

@@ -3,7 +3,7 @@ description: 双栏“院校专业组行 + 专业行”，包含计划余额和�
 priority: 95
 match:
   text_contains:
-    - 普通本科批征集志愿高校分专业名单
+    - 征集志愿高校分专业名单
     - 学校(专业及专业方向)名称与说明
     - 余额线
 parser: two_column_plan_balance_score
@@ -58,6 +58,11 @@ cell_ocr_refinement:
   enabled: true
   scale: 8
   minimum_score: 0.90
+  numeric_pair_ocr:
+    enabled: true
+    band: numeric
+    scale: 8
+    minimum_score: 0.90
   fields:
     专业组计划数:
       row: group
@@ -72,8 +77,29 @@ cell_ocr_refinement:
       band: score
       pattern: '(?:[0-6]\d{2}|7[0-4]\d|750)'
       accept_if_source_invalid: true
+verified_record_corrections:
+  - label: '河南2026第35页周口师范学院第902组漏标题'
+    expected_matches: 1
+    scope_contains:
+      来源文件: '普通本科批征集志愿高校分专业名单（508所）.pdf'
+    match:
+      来源页: '35'
+      _major_side: right
+      院校代码: '6055'
+      专业组代码: '901'
+      专业代码: '70'
+    contains:
+      专业名称及专业方向: '融媒体应用开发'
+    set:
+      院校代码: '6060'
+      院校名称: '周口师范学院'
+      院校专业组代码: '6060902'
+      专业组代码: '902'
+      院校专业组名称: '周口师范学院 第902组(单列专业组)'
+      专业组计划数: '9'
+    note: '源 PDF 第35页右栏人工核验：补回 OCR 漏识别的 6060 周口师范学院第902组标题'
 skip_if_contains:
-  - 普通本科批征集志愿高校分专业名单
+  - 征集志愿高校分专业名单
   - 考生选报征集志愿时
   - 学校(专业及专业方向)名称与说明
   - 计划分数

@@ -1,0 +1,87 @@
+name: ruled-grid-major-plan
+description: 有清晰表格线、每行一个院校专业的扫描型征集计划；按网格边界提取并复识关键代码和计划数。
+priority: 109
+match:
+  path_contains: [fujian]
+  text_contains: [专业组名称, 专业名称, 院校名称]
+parser: ruled_grid_table
+constants:
+  数据类型: 招生计划
+  招生类型: 征集志愿
+context_patterns:
+  批次: '(?P<value>普通类本科批(?:次)?(?:第一次)?(?:征求|征集)志愿)'
+expected_vertical_lines: 11
+anchor_column: 2
+anchor_pattern: '\d{4}'
+grid_columns:
+  院校代码: [2, 3]
+  院校名称: [3, 4]
+  专业组代码: [4, 5]
+  专业组名称: [5, 6]
+  专业代码: [6, 7]
+  专业名称及专业方向: [7, 8]
+  计划数: [8, 9]
+  备注: [9, 10]
+critical_patterns:
+  院校代码: '\d{4}'
+  专业组代码: '[0-9A-Z]{3}'
+  专业代码: '[0-9A-Z]{3}'
+  计划数: '\d+'
+required:
+  - 科类
+  - 院校代码
+  - 院校名称
+  - 专业组代码
+  - 专业组名称
+  - 再选科目
+  - 专业代码
+  - 专业名称及专业方向
+  - 计划数
+critical_confidence: 0.88
+cell_consensus_correction_confidence: 0.85
+always_cell_ocr_fields: [专业组代码, 专业代码]
+conditional_cell_ocr_fields: [院校代码]
+# 同一文件、科类和专业组标签一旦经单元格双路复识确认，后续同行复用证据，
+# 避免对“999/不限选考科目”等重复数百次执行相同 OCR。
+reuse_cell_verified_fields: [专业组代码]
+recover_unanchored_grid_rows: true
+row_presence_fields: [专业代码, 专业名称及专业方向, 计划数]
+# 宁可把只有一个可读关键单元格的横线行送入 review，也不能在解析入口丢掉。
+row_presence_min_fields: 1
+row_header_terms: [院校代码, 院校代号, 专业代码, 专业代号, 专业名称, 计划数]
+code_fields: [院校代码, 院校专业组代码, 专业组代码, 专业代码]
+verified_record_corrections:
+  - label: 福建物理类海南科技职业大学工程造价专业代码
+    scope_contains:
+      来源文件: 物理科目组
+    match:
+      科类: 物理类
+      院校代码: '2837'
+      专业组代码: '999'
+      专业代码: '000'
+    contains:
+      专业名称及专业方向: 工程造价
+      来源文件: 福建省教育考试院
+    expected_matches: 1
+    set:
+      专业代码: '005'
+    remove_issues:
+      - 专业代码网格单元格双路复识未达可信阈值
+    note: 已对照源PDF印刷第21页核验专业代码为005
+  - label: 福建历史类四川轻化工大学旅游管理计划数
+    scope_contains:
+      来源文件: 历史科目组
+    match:
+      科类: 历史类
+      院校代码: '3833'
+      专业组代码: '999'
+      专业代码: '006'
+    contains:
+      来源文件: 福建省教育考试院
+    expected_matches: 1
+    set:
+      计划数: '1'
+    remove_issues:
+      - 缺少必填字段：计划数
+    note: 已对照源PDF第21页核验计划数为1
+review_all: false

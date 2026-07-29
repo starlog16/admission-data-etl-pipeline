@@ -43,9 +43,19 @@ def load_project_config(root: Path) -> ProjectConfig:
 
 def load_profiles(config: ProjectConfig) -> list[dict[str, Any]]:
     profiles_dir = config.path("profiles_root")
+    aliases_path = config.root / "config" / "field_aliases.yaml"
+    shared_aliases: dict[str, list[str]] = {}
+    if aliases_path.exists():
+        alias_config = load_yaml(aliases_path)
+        shared_aliases = {
+            str(field): [str(alias) for alias in aliases]
+            for field, aliases in (alias_config.get("fields") or {}).items()
+        }
     profiles = []
     for path in sorted(profiles_dir.glob("*.yaml")):
         profile = load_yaml(path)
+        if profile.get("header_aliases") == "standard":
+            profile["_header_aliases"] = shared_aliases
         profile["_path"] = str(path)
         profiles.append(profile)
     return sorted(profiles, key=lambda item: int(item.get("priority", 0)), reverse=True)

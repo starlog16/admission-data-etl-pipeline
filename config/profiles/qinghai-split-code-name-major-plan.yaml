@@ -1,0 +1,42 @@
+name: qinghai-split-code-name-major-plan
+description: 横向原生 PDF 征集计划表；院校代号/名称与专业代号/名称各占两列，一行一个专业。
+priority: 110
+match:
+  path_contains: [qinghai]
+  text_contains: [计划类型, 院校代号/名称, 专业代号/名称]
+parser: structured_table
+constants:
+  数据类型: 招生计划
+  招生类型: 征集志愿
+column_map:
+  批次: 0
+  科类: 1
+  计划类别: 2
+  院校代码: 3
+  院校名称: 4
+  专业代码: 5
+  专业名称及专业方向: 6
+  学费: 7
+  计划数: 8
+  备注: 9
+row_key: {field: 院校代码, pattern: '\d{4}'}
+required:
+  - 批次
+  - 科类
+  - 计划类别
+  - 院校代码
+  - 院校名称
+  - 专业代码
+  - 专业名称及专业方向
+  - 学费
+  - 计划数
+integer_fields: [计划数, 学费]
+allowed_values:
+  学费: [待定, 免费]
+watermark_noise_chars: [青, 海, 省, 教, 育, 招, 生, 考, 试, 院]
+watermark_line_fields: [计划类别, 院校名称, 专业名称及专业方向, 学费, 计划数, 备注]
+code_patterns:
+  院校代码: '\d{4}'
+  专业代码: '[0-9A-Z]{3}'
+code_fields: [院校代码, 专业代码]
+review_all: false

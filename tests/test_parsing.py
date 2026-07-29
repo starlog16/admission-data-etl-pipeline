@@ -1,12 +1,58 @@
-from admission_pipeline.domain import ExtractedPage, ParsedRecord, Token
+from admission_pipeline.domain import ExtractedPage, ParseDiagnostics, ParsedRecord, Token
 from admission_pipeline.parsing import (
+    _extract_document_context,
+    _strip_cjk_noise_from_integer_or_allowed,
     _strip_cjk_noise_from_typed_value,
+    _tokens_in_x_band,
     parse_spatial_rows,
     parse_structured_table,
     parse_two_column_hierarchical_plan,
     parse_two_column_plan_balance_score,
     recheck_plan_totals,
 )
+
+
+def test_document_context_maps_again_recruitment_to_second_round() -> None:
+    page = ExtractedPage(
+        source_relative_path="henan/2026/普通本科批再次征集志愿高校分专业名单.pdf",
+        source_sha256="abc",
+        page_number=1,
+        method="image_ocr",
+        width=100,
+        height=100,
+        tokens=[],
+    )
+
+    context = _extract_document_context([page], {})
+
+    assert context["省份"] == "河南"
+    assert context["年份"] == "2026"
+    assert context["征集轮次"] == "2"
+
+
+def test_document_context_keeps_path_province_over_school_location() -> None:
+    page = ExtractedPage(
+        source_relative_path="qinghai/2026/征集志愿/计划.pdf",
+        source_sha256="abc",
+        page_number=1,
+        method="pdf_text",
+        width=100,
+        height=100,
+        tokens=[Token("2026年青海省征集志愿计划，办学地点：广西壮族自治区北海市", 1.0, 0, 0, 100, 10)],
+    )
+
+    context = _extract_document_context([page], {})
+
+    assert context["省份"] == "青海"
+
+
+def test_integer_or_allowed_cleanup_removes_watermark_noise_conservatively() -> None:
+    allowed = {"待定", "免费"}
+    noise = {"考", "试", "院"}
+    assert _strip_cjk_noise_from_integer_or_allowed("试27800", allowed, noise) == "27800"
+    assert _strip_cjk_noise_from_integer_or_allowed("考待定", allowed, noise) == "待定"
+    assert _strip_cjk_noise_from_integer_or_allowed("免费", allowed, noise) == "免费"
+    assert _strip_cjk_noise_from_integer_or_allowed("约20000", allowed, noise) == "约20000"
 
 
 def test_spatial_parser_assigns_columns_and_flags_bad_integer() -> None:
@@ -47,6 +93,13 @@ def test_typed_values_strip_only_unambiguous_cjk_noise() -> None:
     assert _strip_cjk_noise_from_typed_value("院55865", "integer") == "55865"
     assert _strip_cjk_noise_from_typed_value("L78", "integer") == "L78"
     assert _strip_cjk_noise_from_typed_value("001专业组", "text") == "001专业组"
+
+
+def test_column_ownership_uses_token_center_not_left_edge() -> None:
+    tuition = Token("100000", 1.0, 438.5, 100, 481.9, 120)
+
+    assert not _tokens_in_x_band([tuition], 1000, [0.413, 0.44])
+    assert _tokens_in_x_band([tuition], 1000, [0.44, 0.50]) == [tuition]
 
 
 def test_two_column_plan_parser_fills_school_and_merges_wrapped_text() -> None:
@@ -120,6 +173,186 @@ def test_two_column_plan_parser_fills_school_and_merges_wrapped_text() -> None:
     assert records[1].values["_school_side"] == "right"
 
 
+def test_two_column_parser_follows_page_then_column_reading_order() -> None:
+    pages = [
+        ExtractedPage(
+            source_relative_path="hebei/2026/demo.pdf",
+            source_sha256="abc",
+            page_number=1,
+            method="pdf_page_ocr",
+            width=1000,
+            height=1400,
+            tokens=[
+                Token("0001 跨栏大学[公办]", 0.99, 60, 100, 250, 120),
+                Token("2", 0.99, 390, 100, 400, 120),
+                Token("01 汉语言文学", 0.99, 535, 100, 700, 120),
+                Token("不限", 0.99, 750, 100, 790, 120),
+                Token("1", 0.99, 850, 100, 860, 120),
+                Token("4", 0.99, 880, 100, 890, 120),
+                Token("6000", 0.99, 920, 100, 960, 120),
+            ],
+        ),
+        ExtractedPage(
+            source_relative_path="hebei/2026/demo.pdf",
+            source_sha256="abc",
+            page_number=2,
+            method="pdf_page_ocr",
+            width=1000,
+            height=1400,
+            tokens=[
+                Token("02 数学与应用数学", 0.99, 70, 100, 250, 120),
+                Token("不限", 0.99, 290, 100, 330, 120),
+                Token("1", 0.99, 390, 100, 400, 120),
+                Token("4", 0.99, 420, 100, 430, 120),
+                Token("5000", 0.99, 455, 100, 490, 120),
+                Token("0002 新大学[公办]", 0.99, 535, 100, 700, 120),
+                Token("1", 0.99, 850, 100, 860, 120),
+                Token("03 物理学", 0.99, 535, 140, 700, 160),
+                Token("不限", 0.99, 750, 100, 790, 120),
+                Token("1", 0.99, 850, 140, 860, 160),
+                Token("4", 0.99, 880, 140, 890, 160),
+                Token("5000", 0.99, 920, 140, 960, 160),
+            ],
+        ),
+    ]
+    profile = {
+        "page_regions": {
+            "left": {
+                "page": [0.0, 0.5], "description": [0.05, 0.275],
+                "subject": [0.275, 0.374], "plan": [0.374, 0.413],
+                "duration": [0.413, 0.44], "tuition": [0.44, 0.5],
+            },
+            "right": {
+                "page": [0.5, 1.0], "description": [0.515, 0.742],
+                "subject": [0.742, 0.83], "plan": [0.83, 0.868],
+                "duration": [0.868, 0.895], "tuition": [0.895, 1.0],
+            },
+        },
+        "school_pattern": r"^(\d{4})\s*(.+)$",
+        "major_pattern": r"^([0-9A-Za-z]{2})\s*([\u3400-\u9fff（(].+)$",
+        "subject_keywords": ["不限"],
+        "required": ["院校代码", "院校名称", "院校计划总数", "专业代码", "计划数"],
+        "integer_fields": ["院校计划总数", "计划数", "学制"],
+        "code_patterns": {"院校代码": r"\d{4}", "专业代码": r"\d{2}"},
+    }
+    diagnostics = ParseDiagnostics(parser="two_column_hierarchical_plan")
+
+    records = parse_two_column_hierarchical_plan(
+        pages, profile, y_tolerance_ratio=0.65, diagnostics=diagnostics
+    )
+
+    assert [(item.values["院校代码"], item.values["专业代码"]) for item in records] == [
+        ("0001", "01"), ("0001", "02"), ("0002", "03")
+    ]
+    assert diagnostics.coverage_observable
+    assert diagnostics.source_units_detected == diagnostics.records_emitted == 3
+    diagnostics.assert_complete()
+
+
+def test_two_column_parser_retains_major_with_damaged_code_anchor() -> None:
+    page = ExtractedPage(
+        source_relative_path="hebei/2026/demo.pdf",
+        source_sha256="abc",
+        page_number=1,
+        method="pdf_page_ocr",
+        width=1000,
+        height=1400,
+        tokens=[
+            Token("0001 测试大学[公办]", 0.99, 60, 100, 250, 120),
+            Token("1", 0.99, 390, 100, 400, 120),
+            Token("001 环境设计", 0.70, 70, 140, 250, 160),
+            Token("不限", 0.99, 290, 140, 330, 160),
+            Token("1", 0.99, 390, 140, 400, 160),
+            Token("4", 0.99, 420, 140, 430, 160),
+            Token("5000", 0.99, 455, 140, 490, 160),
+            Token("第", 0.99, 420, 1340, 430, 1360),
+            Token("1", 0.99, 390, 1340, 400, 1360),
+        ],
+    )
+    profile = {
+        "page_regions": {
+            "left": {
+                "page": [0.0, 0.5], "description": [0.05, 0.275],
+                "subject": [0.275, 0.374], "plan": [0.374, 0.413],
+                "duration": [0.413, 0.44], "tuition": [0.44, 0.5],
+            },
+            "right": {
+                "page": [0.5, 1.0], "description": [0.515, 0.742],
+                "subject": [0.742, 0.83], "plan": [0.83, 0.868],
+                "duration": [0.868, 0.895], "tuition": [0.895, 1.0],
+            },
+        },
+        "school_pattern": r"^(\d{4})\s*(.+)$",
+        "major_pattern": r"^([0-9A-Za-z]{2})\s*([\u3400-\u9fff（(].+)$",
+        "subject_keywords": ["不限"],
+        "required": ["院校代码", "专业代码", "计划数"],
+        "integer_fields": ["院校计划总数", "计划数", "学制"],
+        "code_patterns": {"院校代码": r"\d{4}", "专业代码": r"\d{2}"},
+    }
+    diagnostics = ParseDiagnostics(parser="two_column_hierarchical_plan")
+
+    records = parse_two_column_hierarchical_plan(
+        [page], profile, y_tolerance_ratio=0.65, diagnostics=diagnostics
+    )
+
+    assert len(records) == 1
+    assert records[0].values["专业代码"] == "001"
+    assert records[0].needs_review
+    assert any("专业代码锚点异常" in issue for issue in records[0].issues)
+    assert diagnostics.recovered_units == 1
+
+
+def test_two_column_parser_retains_numeric_only_major_candidate() -> None:
+    page = ExtractedPage(
+        source_relative_path="hebei/2026/demo.pdf",
+        source_sha256="abc",
+        page_number=1,
+        method="pdf_page_ocr",
+        width=1000,
+        height=1400,
+        tokens=[
+            Token("0001 测试大学[公办]", 0.99, 60, 100, 250, 120),
+            Token("1", 0.99, 390, 100, 400, 120),
+            Token("不限", 0.99, 290, 140, 330, 160),
+            Token("1", 0.99, 390, 140, 400, 160),
+            Token("4", 0.99, 420, 140, 430, 160),
+            Token("5000", 0.99, 455, 140, 490, 160),
+        ],
+    )
+    profile = {
+        "page_regions": {
+            "left": {
+                "page": [0.0, 0.5], "description": [0.05, 0.275],
+                "subject": [0.275, 0.374], "plan": [0.374, 0.413],
+                "duration": [0.413, 0.44], "tuition": [0.44, 0.5],
+            },
+            "right": {
+                "page": [0.5, 1.0], "description": [0.515, 0.742],
+                "subject": [0.742, 0.83], "plan": [0.83, 0.868],
+                "duration": [0.868, 0.895], "tuition": [0.895, 1.0],
+            },
+        },
+        "school_pattern": r"^(\d{4})\s*(.+)$",
+        "major_pattern": r"^([0-9A-Za-z]{2})\s*([\u3400-\u9fff（(].+)$",
+        "subject_keywords": ["不限"],
+        "required": ["院校代码", "专业代码", "专业名称及专业方向", "计划数"],
+        "integer_fields": ["院校计划总数", "计划数", "学制"],
+        "code_patterns": {"院校代码": r"\d{4}", "专业代码": r"\d{2}"},
+    }
+    diagnostics = ParseDiagnostics(parser="two_column_hierarchical_plan")
+
+    records = parse_two_column_hierarchical_plan(
+        [page], profile, y_tolerance_ratio=0.65, diagnostics=diagnostics
+    )
+
+    assert len(records) == 1
+    assert records[0].values["专业代码"] == ""
+    assert records[0].values["计划数"] == "1"
+    assert records[0].needs_review
+    assert diagnostics.source_units_detected == diagnostics.records_emitted == 1
+    assert diagnostics.recovered_units == 1
+
+
 def test_structured_table_uses_cells_and_section_context() -> None:
     page = ExtractedPage(
         source_relative_path="xinjiang/2026/demo.pdf",
@@ -153,6 +386,188 @@ def test_structured_table_uses_cells_and_section_context() -> None:
     assert not records[0].issues
 
 
+def test_structured_table_validates_configured_code_patterns() -> None:
+    page = ExtractedPage(
+        source_relative_path="qinghai/2026/demo.pdf",
+        source_sha256="abc",
+        page_number=1,
+        method="pdf_text",
+        width=100,
+        height=100,
+        tables=[[['2161', '测试学院', '30', '环境设计', '2']]],
+    )
+    profile = {
+        "column_map": {
+            "院校代码": 0,
+            "院校名称": 1,
+            "专业代码": 2,
+            "专业名称及专业方向": 3,
+            "计划数": 4,
+        },
+        "row_key": {"field": "院校代码", "pattern": r"\d{4}"},
+        "required": ["院校代码", "院校名称", "专业代码", "计划数"],
+        "integer_fields": ["计划数"],
+        "code_fields": ["院校代码", "专业代码"],
+        "code_patterns": {"院校代码": r"\d{4}", "专业代码": r"[0-9A-Z]{3}"},
+    }
+
+    records = parse_structured_table([page], profile, y_tolerance_ratio=0.65)
+
+    assert len(records) == 1
+    assert records[0].issues == ["专业代码：代码格式异常（30）"]
+
+
+def test_structured_table_removes_only_configured_leading_watermark_line() -> None:
+    page = ExtractedPage(
+        source_relative_path="qinghai/2026/demo.pdf",
+        source_sha256="abc",
+        page_number=1,
+        method="pdf_text",
+        width=100,
+        height=100,
+        tables=[[['青\n本科普通类', '2161', '教\n测试学院', '303', '育\n环境设计', '试\n27800', '院\n3', '院\n办学地点:测试市']]],
+    )
+    profile = {
+        "column_map": {
+            "计划类别": 0, "院校代码": 1, "院校名称": 2,
+            "专业代码": 3, "专业名称及专业方向": 4,
+            "学费": 5, "计划数": 6, "备注": 7,
+        },
+        "row_key": {"field": "院校代码", "pattern": r"\d{4}"},
+        "required": ["院校代码", "院校名称", "专业代码", "计划数"],
+        "integer_fields": ["计划数", "学费"],
+        "code_fields": ["院校代码", "专业代码"],
+        "watermark_noise_chars": ["青", "教", "育", "试", "院"],
+        "watermark_line_fields": ["计划类别", "院校名称", "专业名称及专业方向", "学费", "计划数", "备注"],
+    }
+
+    records = parse_structured_table([page], profile, y_tolerance_ratio=0.65)
+
+    assert len(records) == 1
+    assert records[0].values["计划类别"] == "本科普通类"
+    assert records[0].values["院校名称"] == "测试学院"
+    assert records[0].values["专业名称及专业方向"] == "环境设计"
+    assert records[0].values["学费"] == "27800"
+    assert records[0].values["计划数"] == "3"
+    assert records[0].values["备注"] == "办学地点:测试市"
+    assert not records[0].issues
+
+
+def test_structured_table_maps_dynamic_headers_and_audits_zero_admission() -> None:
+    page = ExtractedPage(
+        source_relative_path="guizhou/2026/第2次征集志愿投档情况（首选科目物理）.pdf",
+        source_sha256="abc",
+        page_number=1,
+        method="pdf_text",
+        width=100,
+        height=100,
+        tables=[[
+            ["序号", "院校代号", "院校名称", "专业代号", "专业名称", "投档数", "投档最低分", "投档最低位次"],
+            ["1", "0012", "测试大学", "03", "计算机科学与技术", "1", "588", "12345"],
+            ["2", "0013", "示例学院", "04", "数学与应用数学", "0", "", ""],
+        ]],
+    )
+    profile = {
+        "constants": {"数据类型": "投档数据"},
+        "dynamic_header_mapping": True,
+        "_header_aliases": {
+            "序号": ["序号"], "院校代码": ["院校代码", "院校代号"],
+            "院校名称": ["院校名称"], "专业代码": ["专业代码", "专业代号"],
+            "专业名称及专业方向": ["专业名称"], "投档人数": ["投档数"],
+            "最低分": ["投档最低分"], "最低分名次": ["投档最低位次"],
+        },
+        "header_fields": ["序号", "院校代码", "院校名称", "专业代码", "专业名称及专业方向", "投档人数", "最低分", "最低分名次"],
+        "required_header_fields": ["序号", "院校代码", "专业代码", "投档人数", "最低分", "最低分名次"],
+        "row_key": {"field": "序号", "pattern": r"\d+"},
+        "required": ["院校代码", "院校名称", "专业代码", "专业名称及专业方向", "投档人数"],
+        "integer_fields": ["序号", "投档人数", "最低分", "最低分名次"],
+        "code_fields": ["院校代码", "专业代码"],
+        "conditional_required": [{"field": "投档人数", "pattern": r"[1-9]\d*", "required": ["最低分", "最低分名次"]}],
+        "conditional_warnings": [{"field": "投档人数", "pattern": "0", "message": "零投档"}],
+    }
+    records = parse_structured_table([page], profile, y_tolerance_ratio=0.65)
+    assert len(records) == 2
+    assert records[0].values["院校代码"] == "0012"
+    assert records[0].values["最低分名次"] == "12345"
+    assert records[0].values["科类"] == "物理类"
+    assert records[0].values["征集轮次"] == "2"
+    assert not records[0].issues
+    assert not records[1].issues
+    assert records[1].warnings == ["零投档"]
+
+
+def test_structured_table_safely_splits_multiple_major_lines() -> None:
+    page = ExtractedPage(
+        source_relative_path="demo.xlsx", source_sha256="abc", page_number=1,
+        method="spreadsheet", width=100, height=100,
+        tables=[[
+            ["序号", "院校代码", "专业代码", "专业名称", "计划数"],
+            ["1", "0012", "01\n02", "汉语言文学\n历史学", "3\n2"],
+        ]],
+    )
+    profile = {
+        "dynamic_header_mapping": True,
+        "_header_aliases": {
+            "序号": ["序号"], "院校代码": ["院校代码"],
+            "专业代码": ["专业代码"], "专业名称及专业方向": ["专业名称"],
+            "计划数": ["计划数"],
+        },
+        "header_fields": ["序号", "院校代码", "专业代码", "专业名称及专业方向", "计划数"],
+        "required_header_fields": ["序号", "院校代码", "专业代码", "专业名称及专业方向", "计划数"],
+        "row_key": {"field": "序号", "pattern": r"\d+"},
+        "required": ["院校代码", "专业代码", "专业名称及专业方向", "计划数"],
+        "integer_fields": ["序号", "计划数"],
+        "code_fields": ["院校代码", "专业代码"],
+        "split_merged_rows": {
+            "anchor_field": "专业代码", "anchor_pattern": r"\d{2}",
+            "fields": ["专业代码", "专业名称及专业方向", "计划数"],
+        },
+    }
+    records = parse_structured_table([page], profile, y_tolerance_ratio=0.65)
+    assert [(item.values["专业代码"], item.values["专业名称及专业方向"], item.values["计划数"]) for item in records] == [
+        ("01", "汉语言文学", "3"), ("02", "历史学", "2")
+    ]
+    assert all(item.warnings for item in records)
+
+
+def test_structured_table_retains_data_row_with_damaged_row_key() -> None:
+    page = ExtractedPage(
+        source_relative_path="demo.xlsx",
+        source_sha256="abc",
+        page_number=1,
+        method="spreadsheet",
+        width=100,
+        height=100,
+        tables=[[{
+            "序号": "序号",
+            "院校代码": "院校代码",
+            "专业代码": "专业代码",
+            "计划数": "计划数",
+        }.values(), ["I", "0012", "03", "2"]]],
+    )
+    profile = {
+        "column_map": {"序号": 0, "院校代码": 1, "专业代码": 2, "计划数": 3},
+        "row_key": {"field": "序号", "pattern": r"\d+"},
+        "required": ["序号", "院校代码", "专业代码", "计划数"],
+        "integer_fields": ["序号", "计划数"],
+        "code_patterns": {"院校代码": r"\d{4}", "专业代码": r"\d{2}"},
+        "skip_if_contains": ["院校代码|专业代码"],
+    }
+    diagnostics = ParseDiagnostics(parser="structured_table")
+
+    records = parse_structured_table(
+        [page], profile, y_tolerance_ratio=0.65, diagnostics=diagnostics
+    )
+
+    assert len(records) == 1
+    assert records[0].values["院校代码"] == "0012"
+    assert any("行关键字段异常" in issue for issue in records[0].issues)
+    assert diagnostics.source_units_detected == 1
+    assert diagnostics.records_emitted == 1
+    assert diagnostics.recovered_units == 1
+    diagnostics.assert_complete()
+
+
 def test_two_column_plan_balance_score_parses_group_major_and_context() -> None:
     page = ExtractedPage(
         source_relative_path="henan/2026/demo.pdf",
@@ -166,7 +581,7 @@ def test_two_column_plan_balance_score_parses_group_major_and_context() -> None:
             Token("再选：不限", 0.99, 360, 80, 450, 105),
             Token("1435 北京语言大学 第G15组(高校专项计划组)", 0.99, 55, 120, 350, 145),
             Token("1", 0.99, 430, 120, 445, 145),
-            Token("19 外国语言文学类(英语和翻译)(学费：6000元/年)", 0.99, 65, 160, 410, 185),
+            Token("19 外国语言文学类(英语和翻译)(新增计划；学费：6000元/年)", 0.99, 65, 160, 410, 185),
             Token("1 594", 0.99, 430, 160, 490, 185),
             Token("物理类", 0.99, 650, 50, 730, 75),
             Token("再选：生物", 0.99, 820, 80, 900, 105),
@@ -204,6 +619,7 @@ def test_two_column_plan_balance_score_parses_group_major_and_context() -> None:
     assert records[0].values["再选科目"] == "不限"
     assert records[0].values["专业名称及专业方向"] == "外国语言文学类(英语和翻译)"
     assert records[0].values["学费"] == "6000"
+    assert records[0].values["备注"] == "(新增计划；学费：6000元/年)"
     assert records[0].values["分数线"] == "594"
     assert records[1].values["科类"] == "物理类"
     assert records[1].values["再选科目"] == "生物"

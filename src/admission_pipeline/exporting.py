@@ -28,6 +28,27 @@ def _excel_scalar(value: object) -> object:
     return value
 
 
+def _field_evidence_text(record: ParsedRecord) -> str:
+    evidence = record.values.get("_field_evidence", {})
+    if not isinstance(evidence, dict):
+        return ""
+    parts: list[str] = []
+    for field, details in evidence.items():
+        if not isinstance(details, dict):
+            continue
+        raw = details.get("raw_value", "")
+        final = details.get("final_value", raw)
+        cell = details.get("cell_value", "")
+        status = details.get("status", "")
+        confidence = details.get("raw_confidence", "")
+        cell_confidence = details.get("cell_confidence", "")
+        parts.append(
+            f"{field}: raw={raw}({confidence}), cell={cell}({cell_confidence}), "
+            f"final={final}, status={status}"
+        )
+    return "；".join(parts)
+
+
 def _write_sheet(
     sheet: Any,
     records: list[ParsedRecord],
@@ -37,16 +58,21 @@ def _write_sheet(
 ) -> None:
     headers = _headers(records) or list(fallback_headers or [])
     if include_issues:
-        headers.append("待复核原因")
+        headers.extend(["关键字段证据", "审计说明", "待复核原因"])
     sheet.append(headers)
     for cell in sheet[1]:
         cell.font = Font(bold=True)
     for record in records:
-        values = [
-            _excel_scalar(record.values.get(header, ""))
-            for header in headers
-            if header != "待复核原因"
-        ]
+        values = []
+        for header in headers:
+            if header == "待复核原因":
+                continue
+            if header == "关键字段证据":
+                values.append(_field_evidence_text(record))
+            elif header == "审计说明":
+                values.append("；".join(record.warnings))
+            else:
+                values.append(_excel_scalar(record.values.get(header, "")))
         if include_issues:
             values.append("；".join(record.issues))
         sheet.append(values)
@@ -58,6 +84,27 @@ def _write_sheet(
             + [len(str(sheet.cell(row=row, column=index).value or "")) for row in range(2, sheet.max_row + 1)]
         )
         sheet.column_dimensions[get_column_letter(index)].width = min(max(maximum + 2, 10), 42)
+
+
+def _write_audit_sheet(sheet: Any, records: list[ParsedRecord]) -> None:
+    headers = _headers(records) + ["关键字段证据", "审计说明"]
+    sheet.append(headers)
+    for cell in sheet[1]:
+        cell.font = Font(bold=True)
+    for record in records:
+        sheet.append(
+            [
+                *[
+                    _field_evidence_text(record)
+                    if header == "关键字段证据"
+                    else _excel_scalar(record.values.get(header, ""))
+                    for header in headers[:-1]
+                ],
+                "；".join(record.warnings),
+            ]
+        )
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
 
 
 def _write_rows(sheet: Any, headers: list[str], rows: list[list[object]]) -> None:
@@ -74,6 +121,76 @@ def _write_rows(sheet: Any, headers: list[str], rows: list[list[object]]) -> Non
             + [len(str(sheet.cell(row=row, column=index).value or "")) for row in range(2, sheet.max_row + 1)]
         )
         sheet.column_dimensions[get_column_letter(index)].width = min(max(maximum + 2, 10), 42)
+
+
+def _add_review_cases(workbook: Workbook, records: list[ParsedRecord]) -> None:
+    review = [record for record in records if record.needs_review]
+    if not review:
+        return
+    grouped: dict[tuple[str, ...], list[ParsedRecord]] = {}
+    for record in review:
+        source = str(record.values.get("来源文件", ""))
+        issues = "；".join(sorted(record.issues))
+        institution = str(
+            record.values.get("院校名称", "") or record.values.get("院校代码", "")
+        )
+        group = str(
+            record.values.get("专业组代码", "")
+            or record.values.get("院校专业组代码", "")
+        )
+        parent_level = any(
+            marker in issues for marker in ("院校代码", "院校名称", "专业组", "计划数合计")
+        )
+        key = (
+            source,
+            institution if parent_level else str(record.values.get("来源页", "")),
+            group if parent_level else str(record.values.get("来源行", "")),
+            issues,
+        )
+        grouped.setdefault(key, []).append(record)
+
+    rows: list[list[object]] = []
+    for case_number, items in enumerate(grouped.values(), start=1):
+        first = items[0]
+        pages = sorted({str(item.values.get("来源页", "")) for item in items})
+        major_codes = sorted(
+            {
+                str(item.values.get("专业代码", ""))
+                for item in items
+                if str(item.values.get("专业代码", ""))
+            }
+        )
+        rows.append(
+            [
+                f"R{case_number:05d}",
+                len(items),
+                "；".join(first.issues),
+                first.values.get("来源文件", ""),
+                ",".join(pages),
+                first.values.get("院校代码", ""),
+                first.values.get("院校名称", ""),
+                first.values.get("专业组代码", "")
+                or first.values.get("院校专业组代码", ""),
+                ",".join(major_codes[:20]),
+                _field_evidence_text(first),
+            ]
+        )
+    _write_rows(
+        workbook.create_sheet("review_cases"),
+        [
+            "复核案例ID",
+            "影响记录数",
+            "问题类型",
+            "来源文件",
+            "来源页",
+            "院校代码",
+            "院校名称",
+            "专业组代码",
+            "专业代码样例",
+            "关键字段证据",
+        ],
+        rows,
+    )
 
 
 def _add_hierarchy_summaries(workbook: Workbook, records: list[ParsedRecord]) -> None:
@@ -173,6 +290,10 @@ def export_workbook(
             include_issues=True,
             fallback_headers=all_headers,
         )
+        _add_review_cases(workbook, review)
+    audit = [record for record in records if record.warnings and not record.needs_review]
+    if audit:
+        _write_audit_sheet(workbook.create_sheet("audit"), audit)
 
     _add_hierarchy_summaries(workbook, records)
 

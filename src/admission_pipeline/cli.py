@@ -28,6 +28,7 @@ def _compact_daily_result(result: dict[str, object]) -> dict[str, object]:
         "cache_hit_count": sum(bool(item.get("cache_hit")) for item in files),
         "record_count": summary.get("record_count", 0),
         "review_count": summary.get("review_count", 0),
+        "warning_count": summary.get("warning_count", 0),
         "duplicate_count": summary.get("duplicate_count", 0),
         "profiles": summary.get("profiles", {}),
         "output_path": output_path,

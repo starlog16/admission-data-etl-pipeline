@@ -5,7 +5,7 @@ import statistics
 from collections.abc import Iterable
 from typing import Any
 
-from .domain import ExtractedPage, ParsedRecord, Token
+from .domain import ExtractedPage, ParseDiagnostics, ParsedRecord, Token
 
 
 PROVINCE_NAMES = {
@@ -61,6 +61,42 @@ def _strip_cjk_noise_from_typed_value(value: str, declared_type: str) -> str:
     return value
 
 
+def _strip_cjk_noise_from_integer_or_allowed(
+    value: str,
+    allowed_values: set[str],
+    noise_chars: set[str] | None = None,
+) -> str:
+    """Clean watermark text around one integer or one explicitly allowed literal."""
+    if value in allowed_values:
+        return value
+    if noise_chars:
+        numeric_match = re.fullmatch(r"([^0-9]*)([0-9]+)([^0-9]*)", value)
+        if numeric_match and all(
+            char in noise_chars
+            for char in numeric_match.group(1) + numeric_match.group(3)
+        ):
+            return numeric_match.group(2)
+    else:
+        numeric = _strip_cjk_noise_from_typed_value(value, "integer")
+        if numeric != value:
+            return numeric
+    matches = []
+    if noise_chars:
+        matches = [
+            allowed
+            for allowed in allowed_values
+            if (
+                value.endswith(allowed)
+                and all(char in noise_chars for char in value[: -len(allowed)])
+            )
+            or (
+                value.startswith(allowed)
+                and all(char in noise_chars for char in value[len(allowed) :])
+            )
+        ]
+    return matches[0] if len(matches) == 1 else value
+
+
 def _validate_type(value: str, declared_type: str) -> str | None:
     if not value or declared_type == "text":
         return None
@@ -101,7 +137,7 @@ def _extract_document_context(
     }
     for alias, normalized in sorted(aliases.items(), key=lambda item: len(item[0]), reverse=True):
         if alias in title_text:
-            context["省份"] = normalized
+            context.setdefault("省份", normalized)
             break
 
     for field, pattern_text in (profile.get("context_patterns") or {}).items():
@@ -115,6 +151,30 @@ def _extract_document_context(
         else:
             value = match.group(0)
         context[str(field)] = value
+
+    source_text = "/".join(source_parts)
+    for marker, value in (
+        ("物理", "物理类"),
+        ("历史", "历史类"),
+        ("文史", "文史"),
+        ("理工", "理工"),
+    ):
+        if marker in source_text:
+            context.setdefault("科类", value)
+            break
+    round_text = f"{source_text}\n{title_text}"
+    round_match = re.search(r"第\s*(?P<value>[一二三四五六七八九十0-9]+)\s*次", round_text)
+    if round_match:
+        value = round_match.group("value")
+        number_map = {
+            "一": "1", "二": "2", "三": "3", "四": "4", "五": "5",
+            "六": "6", "七": "7", "八": "8", "九": "9", "十": "10",
+        }
+        context.setdefault("征集轮次", number_map.get(value, value))
+    elif "再次征集" in round_text or "再次征求" in round_text:
+        context.setdefault("征集轮次", "2")
+    elif "征集志愿" in round_text or "征求志愿" in round_text:
+        context.setdefault("征集轮次", "1")
     return context
 
 
@@ -123,6 +183,7 @@ def parse_spatial_rows(
     profile: dict[str, Any],
     *,
     y_tolerance_ratio: float,
+    diagnostics: ParseDiagnostics | None = None,
 ) -> list[ParsedRecord]:
     records: list[ParsedRecord] = []
     columns = profile["columns"]
@@ -145,6 +206,9 @@ def parse_spatial_rows(
         re.compile(str(row_key["pattern"])) if row_key.get("pattern") else None
     )
     continuation_field = str(profile.get("continuation_field", ""))
+    critical_confidence = float(profile.get("critical_confidence", 0.88))
+    detected_units = 0
+    recovered_units = 0
 
     for page in pages:
         for row_number, row in enumerate(
@@ -158,6 +222,7 @@ def parse_spatial_rows(
                 continue
             values: dict[str, Any] = dict(context)
             issues: list[str] = []
+            field_evidence: dict[str, dict[str, Any]] = {}
             for column in columns:
                 name = column["name"]
                 selected = [
@@ -177,6 +242,26 @@ def parse_spatial_rows(
                 type_issue = _validate_type(value, column.get("type", "text"))
                 if type_issue:
                     issues.append(f"{name}：{type_issue}（{value}）")
+                declared_type = str(column.get("type", "text"))
+                if declared_type in {"integer", "code"}:
+                    score = min((token.score for token in selected), default=0.0)
+                    status = (
+                        "source_high_confidence"
+                        if value and not type_issue and score >= critical_confidence
+                        else "unresolved"
+                        if value or name in required
+                        else "absent_optional"
+                    )
+                    field_evidence[name] = {
+                        "raw_value": value,
+                        "raw_confidence": round(score, 5),
+                        "final_value": value,
+                        "status": status,
+                    }
+                    if value and not type_issue and score < critical_confidence:
+                        issues.append(
+                            f"{name}OCR置信度低于阈值（{score:.3f}<{critical_confidence:.3f}）"
+                        )
 
             for rule in profile.get("derive_fields", []):
                 source_value = str(values.get(str(rule["source"]), ""))
@@ -198,15 +283,30 @@ def parse_spatial_rows(
                 continue
             if populated < minimum_fields:
                 continue
-            if row_key_pattern and not row_key_pattern.fullmatch(
-                str(values.get(row_key_field, "")).strip()
-            ):
-                continue
+            row_key_value = str(values.get(row_key_field, "")).strip()
+            row_key_valid = not row_key_pattern or bool(
+                row_key_pattern.fullmatch(row_key_value)
+            )
+            if not row_key_valid:
+                typed_evidence = any(
+                    str(values.get(str(column["name"]), "")).strip()
+                    and str(column.get("type", "text")) in {"integer", "code"}
+                    and bool(re.search(r"\d", str(values.get(str(column["name"]), ""))))
+                    for column in columns
+                )
+                if not typed_evidence:
+                    continue
+                issues.append(
+                    f"检测到视觉数据行，但行关键字段异常：{row_key_field}（{row_key_value or '空'}）"
+                )
+                recovered_units += 1
+            detected_units += 1
             missing = [name for name in required if not values.get(name)]
             if missing:
                 issues.append("缺少必填字段：" + "、".join(sorted(missing)))
             if profile.get("review_all", False):
                 issues.append("未匹配到已验证版式，需要人工复核")
+            values["_field_evidence"] = field_evidence
 
             values.update(
                 {
@@ -218,6 +318,12 @@ def parse_spatial_rows(
                 }
             )
             records.append(ParsedRecord(values=values, issues=issues))
+    if diagnostics is not None:
+        diagnostics.coverage_observable = True
+        diagnostics.source_units_detected = detected_units
+        diagnostics.records_emitted = len(records)
+        diagnostics.recovered_units = recovered_units
+        diagnostics.unparsed_units = detected_units - len(records)
     return records
 
 
@@ -225,7 +331,10 @@ def _tokens_in_x_band(
     row: list[Token], page_width: float, band: list[float]
 ) -> list[Token]:
     lower, upper = (float(value) for value in band)
-    return [token for token in row if lower <= token.x1 / page_width < upper]
+    # OCR boxes for long values (especially tuition) often extend a few pixels
+    # into the previous narrow column. The center is the stable ownership signal;
+    # using x1 silently shifted values such as 100000 from 学费 into 学制.
+    return [token for token in row if lower <= token.cx / page_width < upper]
 
 
 def _split_embedded_subject(
@@ -272,6 +381,7 @@ def parse_two_column_hierarchical_plan(
     profile: dict[str, Any],
     *,
     y_tolerance_ratio: float,
+    diagnostics: ParseDiagnostics | None = None,
 ) -> list[ParsedRecord]:
     """Parse two-up recruitment plans with school rows and indented major rows."""
     records: list[ParsedRecord] = []
@@ -288,13 +398,19 @@ def parse_two_column_hierarchical_plan(
     school_pattern = re.compile(profile.get("school_pattern", r"^(\d{4})\s*(.+)$"))
     major_pattern = re.compile(profile.get("major_pattern", r"^([0-9A-Za-z]{2})\s*(.+)$"))
     nature_pattern = re.compile(r"[\[【](公办|民办|独立学院)[\]】]")
+    recovered_major_pattern = re.compile(
+        r"^(?P<major_code>[0-9A-Za-z]{1,3})\s*"
+        r"(?P<major_name>[\u3400-\u9fff（(].+)$"
+    )
+    critical_confidence = float(profile.get("critical_confidence", 0.88))
 
     current_school: dict[str, str] | None = None
     current_major: dict[str, Any] | None = None
     school_had_major = False
-
+    detected_units = 0
+    recovered_units = 0
     def finalize_major() -> None:
-        nonlocal current_major, school_had_major
+        nonlocal current_major, school_had_major, recovered_units
         if current_major is None:
             return
         school = current_school or {}
@@ -337,11 +453,46 @@ def parse_two_column_hierarchical_plan(
             value = str(values.get(field, "")).strip()
             if value and not pattern.fullmatch(value):
                 issues.append(f"{field}：代码格式异常（{value}）")
+        field_scores = {
+            **school.get("_field_scores", {}),
+            **current_major.get("_field_scores", {}),
+        }
+        field_evidence: dict[str, dict[str, Any]] = {}
+        for field in set(code_patterns) | set(integer_fields) | {"学费"}:
+            value = str(values.get(field, "")).strip()
+            score = float(field_scores.get(field, 0.0))
+            if field in code_patterns:
+                valid = bool(code_patterns[field].fullmatch(value))
+            elif field == "学费":
+                valid = bool(re.fullmatch(r"(?:\d{3,6}|待定|免费)", value))
+            else:
+                valid = value.isdigit()
+            status = (
+                "source_high_confidence"
+                if value and valid and score >= critical_confidence
+                else "unresolved"
+                if value or field in required
+                else "absent_optional"
+            )
+            field_evidence[field] = {
+                "raw_value": value,
+                "raw_confidence": round(score, 5),
+                "final_value": value,
+                "status": status,
+            }
+            if value and valid and score < critical_confidence:
+                issues.append(
+                    f"{field}OCR置信度低于阈值（{score:.3f}<{critical_confidence:.3f}）"
+                )
+        values["_field_evidence"] = field_evidence
         records.append(ParsedRecord(values=values, issues=list(dict.fromkeys(issues))))
+        if current_major.get("_recovered", False):
+            recovered_units += 1
         school_had_major = True
         current_major = None
 
     def add_orphan_school_issue() -> None:
+        nonlocal detected_units, recovered_units
         if current_school is None or school_had_major:
             return
         values: dict[str, Any] = {
@@ -363,6 +514,8 @@ def parse_two_column_hierarchical_plan(
         records.append(
             ParsedRecord(values=values, issues=["识别到院校，但未识别到该院校的专业行"])
         )
+        detected_units += 1
+        recovered_units += 1
 
     visual_row_number = 0
     for page in pages:
@@ -379,10 +532,40 @@ def parse_two_column_hierarchical_plan(
                 joined_row = _join_tokens(row)
                 if not joined_row or any(marker in joined_row for marker in skip_markers):
                     continue
-                description = _join_tokens(
-                    _tokens_in_x_band(row, page.width, side_config["description"])
+                if min(token.cy for token in row) / page.height >= float(
+                    profile.get("content_bottom_ratio", 0.92)
+                ):
+                    # Page numbers are frequently split across the narrow numeric
+                    # columns (for example “第 1 页”) and otherwise look like a
+                    # numeric-only major whose description OCR disappeared.
+                    continue
+                description_tokens = _tokens_in_x_band(
+                    row, page.width, side_config["description"]
                 )
-                if not description:
+                subject_tokens = _tokens_in_x_band(
+                    row, page.width, side_config["subject"]
+                )
+                plan_tokens = _tokens_in_x_band(
+                    row, page.width, side_config["plan"]
+                )
+                duration_tokens = _tokens_in_x_band(
+                    row, page.width, side_config["duration"]
+                )
+                tuition_tokens = _tokens_in_x_band(
+                    row, page.width, side_config["tuition"]
+                )
+                description = _join_tokens(description_tokens)
+                explicit_subject = _join_tokens(subject_tokens)
+                plan_value = _join_tokens(plan_tokens)
+                duration_value = _join_tokens(duration_tokens)
+                tuition_value = _join_tokens(tuition_tokens)
+                subject_footprint = any(
+                    keyword in explicit_subject for keyword in subjects
+                )
+                has_field_footprint = bool(
+                    subject_footprint or plan_value or duration_value or tuition_value
+                )
+                if not description and not has_field_footprint:
                     continue
                 if description.count("/") >= 2 and "科目组合" in description:
                     continue
@@ -396,9 +579,7 @@ def parse_two_column_hierarchical_plan(
                         "院校代码": school_match.group(1),
                         "院校名称": nature_pattern.sub("", raw_name).strip(),
                         "院校性质": nature_match.group(1) if nature_match else "",
-                        "院校计划总数": _join_tokens(
-                            _tokens_in_x_band(row, page.width, side_config["plan"])
-                        ),
+                        "院校计划总数": plan_value,
                         "来源文件": page.source_relative_path,
                         "来源页": str(page.page_number),
                         "来源行": str(visual_row_number),
@@ -408,44 +589,103 @@ def parse_two_column_hierarchical_plan(
                         "_school_page": page.page_number,
                         "_school_y1": min(token.y1 for token in row),
                         "_school_y2": max(token.y2 for token in row),
+                        "_field_scores": {
+                            "院校代码": min(
+                                (token.score for token in description_tokens),
+                                default=0.0,
+                            ),
+                            "院校计划总数": min(
+                                (token.score for token in plan_tokens),
+                                default=0.0,
+                            ),
+                        },
                     }
                     school_had_major = False
                     continue
 
                 major_match = major_pattern.fullmatch(description)
-                if major_match:
-                    finalize_major()
-                    name, embedded_subject = _split_embedded_subject(
-                        major_match.group(2).strip(), subjects
+                recovered_major_match = (
+                    recovered_major_pattern.fullmatch(description)
+                    if not major_match
+                    else None
+                )
+                looks_like_damaged_major = bool(
+                    current_school is not None
+                    and not description.startswith(("[", "【"))
+                    and (
+                        recovered_major_match
+                        or subject_footprint
+                        or plan_value.isdigit()
+                        or duration_value.isdigit()
+                        or tuition_value.isdigit()
+                        or tuition_value in {"待定", "免费"}
                     )
-                    explicit_subject = _join_tokens(
-                        _tokens_in_x_band(row, page.width, side_config["subject"])
+                )
+                if major_match or looks_like_damaged_major:
+                    # Count the visual source candidate before a record is
+                    # finalized so completeness is not inferred from output.
+                    detected_units += 1
+                    finalize_major()
+                    recovered = major_match is None
+                    raw_major_code = (
+                        major_match.group(1)
+                        if major_match
+                        else recovered_major_match.group("major_code")
+                        if recovered_major_match
+                        else ""
+                    )
+                    raw_major_name = (
+                        major_match.group(2)
+                        if major_match
+                        else recovered_major_match.group("major_name")
+                        if recovered_major_match
+                        else description
+                    )
+                    name, embedded_subject = _split_embedded_subject(
+                        raw_major_name.strip(), subjects
                     )
                     current_major = {
-                        "专业代码": major_match.group(1),
+                        "专业代码": raw_major_code,
                         "专业名称及专业方向": name,
                         "再选科目": explicit_subject or embedded_subject,
-                        "计划数": _join_tokens(
-                            _tokens_in_x_band(row, page.width, side_config["plan"])
-                        ),
-                        "学制": _join_tokens(
-                            _tokens_in_x_band(row, page.width, side_config["duration"])
-                        ),
-                        "学费": _join_tokens(
-                            _tokens_in_x_band(row, page.width, side_config["tuition"])
-                        ),
+                        "计划数": plan_value,
+                        "学制": duration_value,
+                        "学费": tuition_value,
                         "备注": "",
                         "来源文件": page.source_relative_path,
                         "来源页": str(page.page_number),
                         "来源行": str(visual_row_number),
                         "提取方式": page.method,
                         "原始行文本": joined_row,
-                        "issues": [],
+                        "issues": (
+                            ["专业行结构已保留，但专业代码锚点异常"]
+                            if recovered
+                            else []
+                        ),
                         "in_note": False,
                         "_major_side": side,
                         "_major_page": page.page_number,
                         "_major_y1": min(token.y1 for token in row),
                         "_major_y2": max(token.y2 for token in row),
+                        "_recovered": recovered,
+                        "_field_scores": {
+                            "专业代码": min(
+                                (token.score for token in description_tokens),
+                                default=0.0,
+                            ),
+                            "计划数": min(
+                                (token.score for token in plan_tokens),
+                                default=0.0,
+                            ),
+                            "学制": min(
+                                (token.score for token in duration_tokens),
+                                default=0.0,
+                            ),
+                            "学费": min(
+                                (token.score for token in tuition_tokens),
+                                default=0.0,
+                            ),
+                        },
                     }
                     if current_school is None:
                         current_major["issues"].append("专业行之前未识别到所属院校")
@@ -467,11 +707,30 @@ def parse_two_column_hierarchical_plan(
                             "", current_school["院校名称"]
                         ).strip()
                     current_school["原始行文本"] += " | " + joined_row
-
     finalize_major()
     add_orphan_school_issue()
 
     recheck_plan_totals(records)
+    records.sort(
+        key=lambda record: (
+            str(record.values.get("来源文件", "")),
+            int(record.values.get("来源页", 0) or 0),
+            0
+            if (
+                record.values.get("_major_side")
+                or record.values.get("_school_side")
+            )
+            == "left"
+            else 1,
+            int(record.values.get("来源行", 0) or 0),
+        )
+    )
+    if diagnostics is not None:
+        diagnostics.coverage_observable = True
+        diagnostics.source_units_detected = detected_units
+        diagnostics.records_emitted = len(records)
+        diagnostics.recovered_units = recovered_units
+        diagnostics.unparsed_units = detected_units - len(records)
     return records
 
 
@@ -575,7 +834,7 @@ def parse_two_column_plan_balance_score(
                 "六": "6", "七": "7", "八": "8", "九": "9", "十": "10",
             }
             duration = duration_map.get(chinese_duration.group(1), "") if chinese_duration else ""
-        detail_match = re.search(r"[（(]学(?:费|制)", value)
+        detail_match = re.search(r"[（(](?=(?:部分)?新增计划|学(?:费|制))", value)
         if detail_match:
             name = value[: detail_match.start()].strip()
             note = value[detail_match.start() :].strip()
@@ -1083,29 +1342,195 @@ def _clean_table_cell(value: object) -> str:
     return re.sub(r"[ \t]+", " ", text).strip()
 
 
+def _table_cell_lines(value: object) -> list[str]:
+    text = str(value or "").replace("\r", "\n")
+    return [
+        _clean_table_cell(part)
+        for part in re.split(r"\n+", text)
+        if _clean_table_cell(part)
+    ]
+
+
+def _normalize_header(value: object) -> str:
+    return re.sub(r"[\s（）()：:、，,。·/\\_\-]+", "", str(value or "")).casefold()
+
+
+def _dynamic_column_map(
+    row: list[object], profile: dict[str, Any]
+) -> dict[str, int]:
+    aliases = profile.get("_header_aliases") or {}
+    allowed_fields = [
+        str(field)
+        for field in profile.get("header_fields", aliases.keys())
+    ]
+    normalized_cells = [_normalize_header(value) for value in row]
+    result: dict[str, int] = {}
+    used_columns: dict[int, str] = {}
+    for field in allowed_fields:
+        candidates = {
+            _normalize_header(alias)
+            for alias in [field, *(aliases.get(field) or [])]
+            if str(alias).strip()
+        }
+        matches = [
+            index for index, value in enumerate(normalized_cells)
+            if value and value in candidates
+        ]
+        if len(matches) > 1:
+            raise RuntimeError(f"表头字段“{field}”同时命中多列：{matches}")
+        if not matches:
+            continue
+        column = matches[0]
+        if column in used_columns:
+            raise RuntimeError(
+                f"表头列{column}同时映射为“{used_columns[column]}”和“{field}”，已停止解析。"
+            )
+        result[field] = column
+        used_columns[column] = field
+    required_headers = [str(field) for field in profile.get("required_header_fields", [])]
+    if required_headers and not all(field in result for field in required_headers):
+        return {}
+    return result
+
+
+def _split_structured_values(
+    values: dict[str, Any],
+    value_lines: dict[str, list[str]],
+    profile: dict[str, Any],
+) -> list[tuple[dict[str, Any], list[str]]]:
+    rule = profile.get("split_merged_rows") or {}
+    if not rule:
+        return [(values, [])]
+    anchor_field = str(rule.get("anchor_field", "专业代码"))
+    anchor_lines = value_lines.get(anchor_field, [])
+    anchor_pattern = re.compile(str(rule.get("anchor_pattern", r"[0-9A-Za-z]{2,4}")))
+    if len(anchor_lines) <= 1 or not all(anchor_pattern.fullmatch(line) for line in anchor_lines):
+        return [(values, [])]
+
+    count = len(anchor_lines)
+    split_fields = [str(field) for field in rule.get("fields", [])]
+    repeat_fields = {str(field) for field in rule.get("repeat_fields", [])}
+    incompatible = [
+        field
+        for field in split_fields
+        if value_lines.get(field)
+        and len(value_lines[field]) not in ({1, count} if field in repeat_fields else {count})
+    ]
+    if incompatible:
+        return [(
+            values,
+            [
+                "疑似同一单元格包含多条专业，但以下字段行数无法安全对齐："
+                + "、".join(incompatible)
+            ],
+        )]
+
+    rows: list[tuple[dict[str, Any], list[str]]] = []
+    for index in range(count):
+        copied = dict(values)
+        for field in split_fields:
+            lines = value_lines.get(field, [])
+            if len(lines) == count:
+                copied[field] = lines[index]
+            elif len(lines) == 1 and field in repeat_fields:
+                copied[field] = lines[0]
+        rows.append((copied, [f"源表合并单元格已安全拆分为{count}条专业记录"]))
+    return rows
+
+
+def _apply_conditional_checks(
+    values: dict[str, Any], profile: dict[str, Any]
+) -> tuple[list[str], list[str]]:
+    issues: list[str] = []
+    warnings: list[str] = []
+    for rule in profile.get("conditional_required", []):
+        field = str(rule["field"])
+        if not re.fullmatch(str(rule["pattern"]), str(values.get(field, "")).strip()):
+            continue
+        missing = [
+            str(required)
+            for required in rule.get("required", [])
+            if not str(values.get(str(required), "")).strip()
+        ]
+        if missing:
+            issues.append(
+                str(rule.get("message") or "条件必填字段缺失：") + "、".join(missing)
+            )
+    for rule in profile.get("conditional_warnings", []):
+        field = str(rule["field"])
+        if re.fullmatch(str(rule["pattern"]), str(values.get(field, "")).strip()):
+            warnings.append(str(rule["message"]))
+    return issues, warnings
+
+
+def _looks_like_structured_data_row(
+    values: dict[str, Any],
+    *,
+    required: list[str],
+    integer_fields: list[str],
+    code_patterns: dict[str, re.Pattern[str]],
+    minimum_populated: int,
+) -> bool:
+    """Keep damaged data rows without mistaking ordinary title/header rows for data."""
+    populated = sum(bool(str(values.get(field, "")).strip()) for field in required)
+    if populated < minimum_populated:
+        return False
+    has_numeric_evidence = any(
+        str(values.get(field, "")).strip().isdigit() for field in integer_fields
+    )
+    has_code_evidence = any(
+        bool(pattern.fullmatch(str(values.get(field, "")).strip()))
+        for field, pattern in code_patterns.items()
+    )
+    return has_numeric_evidence or has_code_evidence
+
+
 def parse_structured_table(
     pages: list[ExtractedPage],
     profile: dict[str, Any],
     *,
     y_tolerance_ratio: float,
+    diagnostics: ParseDiagnostics | None = None,
 ) -> list[ParsedRecord]:
-    """Parse PDF-detected tables and original workbooks by stable column index."""
+    """Parse native PDF/worksheet tables, preferring conservative header mapping."""
     if not any(page.tables for page in pages):
         fallback = profile.get("fallback_parser")
         if fallback == "spatial_rows":
-            return parse_spatial_rows(pages, profile, y_tolerance_ratio=y_tolerance_ratio)
+            return parse_spatial_rows(
+                pages,
+                profile,
+                y_tolerance_ratio=y_tolerance_ratio,
+                diagnostics=diagnostics,
+            )
         if fallback == "flat_major_plan":
             return parse_flat_major_plan(pages, profile, y_tolerance_ratio=y_tolerance_ratio)
         return []
 
     context = _extract_document_context(pages, profile)
-    column_map = {str(field): int(index) for field, index in profile["column_map"].items()}
+    fallback_column_map = {
+        str(field): int(index)
+        for field, index in (profile.get("column_map") or {}).items()
+    }
     required = [str(value) for value in profile.get("required", [])]
     integer_fields = [str(value) for value in profile.get("integer_fields", [])]
+    allowed_values = {
+        str(field): {str(value) for value in values}
+        for field, values in (profile.get("allowed_values") or {}).items()
+    }
+    watermark_noise_chars = {
+        str(value) for value in profile.get("watermark_noise_chars", [])
+    }
+    watermark_line_fields = {
+        str(value) for value in profile.get("watermark_line_fields", [])
+    }
+    code_patterns = {
+        str(field): re.compile(str(pattern))
+        for field, pattern in (profile.get("code_patterns") or {}).items()
+    }
     skip_markers = [str(value) for value in profile.get("skip_if_contains", [])]
     row_key = profile.get("row_key") or {}
     row_key_field = str(row_key.get("field", ""))
-    row_key_pattern = re.compile(str(row_key["pattern"]))
+    row_key_pattern = re.compile(str(row_key.get("pattern", r".+")))
     section_pattern = (
         re.compile(str(profile["section_pattern"]))
         if profile.get("section_pattern")
@@ -1114,64 +1539,162 @@ def parse_structured_table(
     section_field = str(profile.get("section_field", "计划类别"))
     current_section = ""
     records: list[ParsedRecord] = []
+    detected_units = 0
+    recovered_units = 0
     source_row = 0
 
     for page in pages:
         for table in page.tables:
+            column_map = dict(fallback_column_map)
             for row in table:
                 source_row += 1
                 cells = [_clean_table_cell(value) for value in row]
                 joined = "|".join(cells)
                 if not any(cells) or any(marker in joined for marker in skip_markers):
                     continue
+                if profile.get("dynamic_header_mapping", False):
+                    detected = _dynamic_column_map(row, profile)
+                    if detected:
+                        column_map = detected
+                        continue
+                if not column_map:
+                    continue
                 nonempty = [value for value in cells if value]
                 if section_pattern and len(nonempty) == 1 and section_pattern.fullmatch(nonempty[0]):
                     current_section = nonempty[0]
                     continue
                 values: dict[str, Any] = dict(context)
+                value_lines: dict[str, list[str]] = {}
                 for field, index in column_map.items():
-                    values[field] = cells[index] if index < len(cells) else ""
+                    lines = _table_cell_lines(row[index]) if index < len(row) else []
+                    if (
+                        field in watermark_line_fields
+                        and len(lines) > 1
+                        and len(lines[0]) == 1
+                        and lines[0] in watermark_noise_chars
+                    ):
+                        lines = lines[1:]
+                    values[field] = "".join(lines) if lines else (
+                        cells[index] if index < len(cells) else ""
+                    )
+                    value_lines[field] = lines
                 for selector_field, choices in (profile.get("dynamic_fields") or {}).items():
                     selected = (choices or {}).get(str(values.get(selector_field, "")), {})
                     for source_field, target_field in selected.items():
                         values[str(target_field)] = values.pop(str(source_field), "")
                 if current_section:
                     values[section_field] = current_section
-                if not row_key_pattern.fullmatch(str(values.get(row_key_field, "")).strip()):
-                    continue
-                for rule in profile.get("derive_fields", []):
-                    source_value = str(values.get(str(rule["source"]), ""))
-                    match = re.search(str(rule["pattern"]), source_value)
-                    if match:
-                        for index, field in enumerate(rule.get("fields", []), start=1):
-                            values[str(field)] = match.group(index)
-                for field in integer_fields:
-                    values[field] = _strip_cjk_noise_from_typed_value(
-                        str(values.get(field, "")), "integer"
+                split_rows = _split_structured_values(values, value_lines, profile)
+                for split_values, split_warnings in split_rows:
+                    row_key_value = str(split_values.get(row_key_field, "")).strip()
+                    row_key_valid = bool(row_key_pattern.fullmatch(row_key_value))
+                    if not row_key_valid and not _looks_like_structured_data_row(
+                        split_values,
+                        required=required,
+                        integer_fields=integer_fields,
+                        code_patterns=code_patterns,
+                        minimum_populated=int(
+                            profile.get("candidate_row_minimum_populated", 2)
+                        ),
+                    ):
+                        continue
+                    detected_units += 1
+                    if not row_key_valid:
+                        recovered_units += 1
+                    for rule in profile.get("derive_fields", []):
+                        source_value = str(split_values.get(str(rule["source"]), ""))
+                        match = re.search(str(rule["pattern"]), source_value)
+                        if match:
+                            for index, field in enumerate(rule.get("fields", []), start=1):
+                                split_values[str(field)] = match.group(index)
+                    for field in integer_fields:
+                        split_values[field] = _strip_cjk_noise_from_integer_or_allowed(
+                            str(split_values.get(field, "")),
+                            allowed_values.get(field, set()),
+                            watermark_noise_chars,
+                        )
+                    for field in profile.get("code_fields", []):
+                        split_values[str(field)] = _strip_cjk_noise_from_typed_value(
+                            str(split_values.get(str(field), "")), "code"
+                        )
+                    split_values.update(
+                        {
+                            "来源文件": page.source_relative_path,
+                            "来源页": page.page_number,
+                            "来源工作表": page.sheet_name,
+                            "来源行": source_row,
+                            "提取方式": page.method,
+                            "原始行文本": joined,
+                        }
                     )
-                for field in profile.get("code_fields", []):
-                    values[str(field)] = _strip_cjk_noise_from_typed_value(
-                        str(values.get(str(field), "")), "code"
+                    issues: list[str] = []
+                    if not row_key_valid:
+                        issues.append(
+                            f"检测到结构化数据行，但行关键字段异常：{row_key_field}（{row_key_value or '空'}）"
+                        )
+                    for field in required:
+                        if not str(split_values.get(field, "")).strip():
+                            issues.append(f"缺少必填字段：{field}")
+                    for field in integer_fields:
+                        value = str(split_values.get(field, "")).strip()
+                        if (
+                            value
+                            and not value.isdigit()
+                            and value not in allowed_values.get(field, set())
+                        ):
+                            issues.append(f"{field}：应为整数（{value}）")
+                    for field, pattern in code_patterns.items():
+                        value = str(split_values.get(field, "")).strip()
+                        if value and not pattern.fullmatch(value):
+                            issues.append(f"{field}：代码格式异常（{value}）")
+                    field_evidence: dict[str, dict[str, Any]] = {}
+                    for field, pattern in code_patterns.items():
+                        value = str(split_values.get(field, "")).strip()
+                        field_evidence[field] = {
+                            "raw_value": value,
+                            "final_value": value,
+                            "status": (
+                                "structured_source"
+                                if value and pattern.fullmatch(value)
+                                else "unresolved"
+                                if value or field in required
+                                else "absent_optional"
+                            ),
+                        }
+                    for field in integer_fields:
+                        value = str(split_values.get(field, "")).strip()
+                        valid = value.isdigit() or value in allowed_values.get(field, set())
+                        field_evidence.setdefault(
+                            field,
+                            {
+                                "raw_value": value,
+                                "final_value": value,
+                                "status": (
+                                    "structured_source"
+                                    if value and valid
+                                    else "unresolved"
+                                    if value or field in required
+                                    else "absent_optional"
+                                ),
+                            },
+                        )
+                    split_values["_field_evidence"] = field_evidence
+                    conditional_issues, conditional_warnings = _apply_conditional_checks(
+                        split_values, profile
                     )
-                values.update(
-                    {
-                        "来源文件": page.source_relative_path,
-                        "来源页": page.page_number,
-                        "来源工作表": page.sheet_name,
-                        "来源行": source_row,
-                        "提取方式": page.method,
-                        "原始行文本": joined,
-                    }
-                )
-                issues: list[str] = []
-                for field in required:
-                    if not str(values.get(field, "")).strip():
-                        issues.append(f"缺少必填字段：{field}")
-                for field in integer_fields:
-                    value = str(values.get(field, "")).strip()
-                    if value and not value.isdigit():
-                        issues.append(f"{field}：应为整数（{value}）")
-                records.append(ParsedRecord(values=values, issues=issues))
+                    records.append(
+                        ParsedRecord(
+                            values=split_values,
+                            issues=[*issues, *conditional_issues],
+                            warnings=[*split_warnings, *conditional_warnings],
+                        )
+                    )
+    if diagnostics is not None:
+        diagnostics.coverage_observable = True
+        diagnostics.source_units_detected = detected_units
+        diagnostics.records_emitted = len(records)
+        diagnostics.recovered_units = recovered_units
+        diagnostics.unparsed_units = detected_units - len(records)
     return records
 
 
@@ -1233,16 +1756,28 @@ def recheck_plan_totals(records: list[ParsedRecord]) -> None:
 
 
 def parse_pages(
-    pages: list[ExtractedPage], profile: dict[str, Any], *, y_tolerance_ratio: float
+    pages: list[ExtractedPage],
+    profile: dict[str, Any],
+    *,
+    y_tolerance_ratio: float,
+    source_path: Any = None,
+    cell_ocr_cache_root: Any = None,
+    diagnostics: ParseDiagnostics | None = None,
 ) -> list[ParsedRecord]:
     parser_name = profile.get("parser")
     if parser_name == "spatial_rows":
         return parse_spatial_rows(
-            pages, profile, y_tolerance_ratio=y_tolerance_ratio
+            pages,
+            profile,
+            y_tolerance_ratio=y_tolerance_ratio,
+            diagnostics=diagnostics,
         )
     if parser_name == "two_column_hierarchical_plan":
         return parse_two_column_hierarchical_plan(
-            pages, profile, y_tolerance_ratio=y_tolerance_ratio
+            pages,
+            profile,
+            y_tolerance_ratio=y_tolerance_ratio,
+            diagnostics=diagnostics,
         )
     if parser_name == "two_column_plan_balance_score":
         return parse_two_column_plan_balance_score(
@@ -1258,6 +1793,20 @@ def parse_pages(
         )
     if parser_name == "structured_table":
         return parse_structured_table(
-            pages, profile, y_tolerance_ratio=y_tolerance_ratio
+            pages,
+            profile,
+            y_tolerance_ratio=y_tolerance_ratio,
+            diagnostics=diagnostics,
+        )
+    if parser_name == "ruled_grid_table":
+        from .grid_parsing import parse_ruled_grid_table
+
+        return parse_ruled_grid_table(
+            pages,
+            profile,
+            source_path=source_path,
+            context=_extract_document_context(pages, profile),
+            cell_ocr_cache_root=cell_ocr_cache_root,
+            diagnostics=diagnostics,
         )
     raise ValueError(f"不支持的解析器：{parser_name}")

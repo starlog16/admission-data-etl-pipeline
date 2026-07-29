@@ -7,6 +7,15 @@ match:
     - 专业说明
 parser: structured_table
 fallback_parser: flat_major_plan
+dynamic_header_mapping: true
+header_aliases: standard
+header_fields: [序号, 科类, 院校代码, 院校名称, 计划类别, 专业代码, 专业名称及专业方向, 分数线, 再选科目, 计划数, 外语语种, 学制, 学费, 备注]
+required_header_fields: [序号, 院校代码, 院校名称, 专业代码, 专业名称及专业方向, 计划数]
+split_merged_rows:
+  anchor_field: 专业代码
+  anchor_pattern: '[0-9A-Za-z]{2,4}'
+  fields: [专业代码, 专业名称及专业方向, 分数线, 再选科目, 计划数, 外语语种, 学制, 学费, 备注]
+  repeat_fields: [再选科目, 外语语种, 学制, 学费, 备注]
 constants:
   数据类型: 征集计划
 context_patterns:

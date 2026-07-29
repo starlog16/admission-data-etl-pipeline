@@ -15,6 +15,11 @@ def _all_text_present(haystack: str, needles: list[str]) -> bool:
     return all(re.sub(r"\s+", "", needle).casefold() in normalized for needle in needles)
 
 
+def _all_text_patterns(haystack: str, patterns: list[str]) -> bool:
+    normalized = re.sub(r"\s+", "", haystack)
+    return all(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in patterns)
+
+
 def profile_matches(
     profile: dict[str, Any], relative_path: Path, document_text: str = ""
 ) -> bool:
@@ -27,6 +32,7 @@ def profile_matches(
         _all_present(full, match.get("path_contains", []))
         and _all_present(filename, match.get("filename_contains", []))
         and _all_text_present(document_text, match.get("text_contains", []))
+        and _all_text_patterns(document_text, match.get("text_patterns", []))
     )
 
 
